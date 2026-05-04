@@ -1,357 +1,239 @@
-# Production Data Pipeline Architecture
+# Production Data Pipeline
 
-A complete, production-grade data pipeline that ingests 500GB+ daily from 20 sources, transforms with Spark, orchestrates with Airflow, and serves to analysts with 99.9% reliability.
+A production-grade data pipeline: ingests 500 GB/day from 20 sources, transforms with Spark, orchestrates with Airflow, stores in MinIO (S3-compatible), and exposes metrics via Prometheus + Grafana.
 
-**Architecture**: Batch + Streaming (Lambda pattern)
-**Latency**: 4 hours for batch, real-time for streaming
-**Reliability**: 99.9% uptime with automated recovery
-**Cost**: Optimized for cloud (AWS/GCP/Azure)
-
----
-
-## 🏗️ Project Structure
-
-```
-production-data-pipeline/
-├── README.md                          (This file)
-├── QUICK_START.md                     (5-minute quick start)
-├── docker-compose.yml                 (Local development stack)
-├── requirements.txt                   (Python dependencies)
-│
-├── config/                            (Configuration)
-│   ├── pipeline_config.yaml           (Data sources, schemas, quality gates)
-│   ├── logging_config.yaml            (Structured logging setup)
-│   ├── prometheus.yml                 (Prometheus scrape config)
-│   └── env.example                    (Environment variables template)
-│
-├── src/                               (Main source code)
-│   ├── __init__.py
-│   ├── ingestion/                     (Data ingestion layer)
-│   │   ├── __init__.py
-│   │   ├── base_connector.py          (Base class)
-│   │   ├── api_connector.py           (REST API ingestion)
-│   │   ├── file_connector.py          (S3/local files)
-│   │   ├── kafka_connector.py         (Kafka streaming)
-│   │   └── decorators.py              (Retry, rate limiting)
-│   │
-│   ├── validation/                    (Data quality)
-│   │   ├── __init__.py
-│   │   ├── schema_validator.py        (Schema enforcement)
-│   │   ├── quality_gates.py           (Quality thresholds)
-│   │   ├── deduplication.py           (Duplicate detection)
-│   │   └── data_profiler.py           (Statistical profiling)
-│   │
-│   ├── transformation/                (Spark transformations)
-│   │   ├── __init__.py
-│   │   ├── spark_transformer.py       (Base transformer)
-│   │   ├── aggregations.py            (Common aggregations)
-│   │   └── enrichment.py              (Data enrichment)
-│   │
-│   ├── warehouse/                     (Load to warehouse)
-│   │   ├── __init__.py
-│   │   ├── warehouse_loader.py        (Base loader)
-│   │   └── snowflake_loader.py        (Snowflake specific)
-│   │
-│   └── monitoring/                    (Health & metrics)
-│       ├── __init__.py
-│       ├── metrics.py                 (Prometheus metrics)
-│       ├── alerting.py                (Alert triggers)
-│       └── lineage.py                 (Data lineage tracking)
-│
-├── airflow/                           (Orchestration)
-│   ├── dags/
-│   │   ├── __init__.py
-│   │   ├── daily_batch_pipeline.py    (Main batch DAG)
-│   │   ├── kafka_streaming_dag.py     (Streaming DAG)
-│   │   └── monitoring_dag.py          (Health checks)
-│   │
-│   └── plugins/
-│       ├── __init__.py
-│       └── custom_operators.py        (Custom operators)
-│
-├── spark/                             (Spark jobs)
-│   ├── transform_daily.py             (Daily transformation)
-│   ├── aggregate_metrics.py           (Analytics aggregation)
-│   └── streaming_job.py               (Streaming processor)
-│
-├── tests/                             (Testing)
-│   ├── __init__.py
-│   ├── test_ingestion.py              (Unit tests)
-│   ├── test_validation.py
-│   ├── test_transformation.py
-│   └── integration/
-│       └── test_e2e_pipeline.py       (E2E tests)
-│
-├── scripts/                           (Utilities)
-│   ├── setup.sh                       (One-time setup script)
-│   ├── cleanup.sh                     (Teardown script)
-│   ├── generate_test_data.py          (Test data generation)
-│   └── monitor_pipeline.py            (CLI health check)
-│
-└── docs/                              (Documentation)
-    ├── ARCHITECTURE.md                (Design decisions)
-    ├── SETUP.md                       (Getting started)
-    ├── DEPLOYMENT.md                  (Production deployment)
-    ├── TROUBLESHOOTING.md             (Common issues)
-    ├── OPERATIONS.md                  (Running & monitoring)
-    └── API.md                         (Module documentation)
-```
+**Stack**: Airflow 3 · Spark 4 · Kafka (KRaft) · PostgreSQL 18 · MinIO · Prometheus · Grafana  
+**SLA**: 4-hour batch window  
+**Pattern**: Lambda (batch + streaming)
 
 ---
 
-## 🚀 Quick Start (5 minutes)
+## Prerequisites
 
-### 1. Install dependencies
+| Tool | Version | Install |
+|------|---------|---------|
+| Docker Desktop | 4.x+ | https://docs.docker.com/desktop/ |
+| mise | latest | `brew install mise` |
+| Poetry | 1.8+ | `pipx install poetry` |
+
+---
+
+## Running the stack
+
+### 1. Set up Python
+
 ```bash
-# Install Poetry if needed
-curl -sSL https://install.python-poetry.org | python3 -
+# Install Python 3.12 (required — stack is not compatible with 3.13/3.14)
+mise install python@3.12
+mise local python 3.12
 
-cd production-data-pipeline
+# Verify
+python --version   # Python 3.12.x
+```
 
-# Core + dev dependencies
+### 2. Install Python dependencies
+
+```bash
+# Core + dev tools
 poetry install --with dev
 
-# Optional: add Airflow, Snowflake, or advanced quality tools
-poetry install --with airflow,warehouse,quality
+# Optional: Airflow operators/providers (for IDE type checking)
+poetry install --with airflow
+
+# Point your IDE to the venv
+poetry env info --path   # copy this path → set as Python interpreter
 ```
 
-### 2. Configure and start services
-```bash
-cp config/env.example .env      # fill in secrets
-docker-compose up -d
-# Services: Airflow, PostgreSQL, MinIO (S3), Kafka, Spark
-```
-
-### 3. Run Pipeline
-```bash
-# Generate test data
-poetry run python scripts/generate_test_data.py --size small
-
-# Trigger DAG manually
-poetry run airflow dags trigger daily_batch_pipeline
-
-# Monitor in UI: http://localhost:8080 (Airflow)  http://localhost:9001 (MinIO)
-```
-
-### 4. Check Results
-```bash
-poetry run python scripts/monitor_pipeline.py --status
-poetry run python scripts/monitor_pipeline.py --quality
-```
-
----
-
-## 📊 Architecture Overview
-
-### Data Flow
-```
-Data Sources (20)
-    ├─ REST APIs
-    ├─ Databases
-    ├─ Files (S3, GCS)
-    └─ Kafka topics
-         ↓
-    ┌─ Ingestion Layer (async, parallel)
-    │  ├─ Schema validation
-    │  ├─ Deduplication
-    │  └─ Bad record handling
-    ↓
-    ┌─ Transformation Layer (Spark)
-    │  ├─ Cleanse (nulls, types)
-    │  ├─ Enrich (join reference data)
-    │  └─ Aggregate (daily rollups)
-    ↓
-    ┌─ Data Warehouse
-    │  ├─ Fact tables (events, transactions)
-    │  ├─ Dimension tables (users, products)
-    │  └─ Aggregate tables (for fast queries)
-    ↓
-    ┌─ Analyst Access
-       ├─ BI Tools (Tableau, Looker)
-       ├─ SQL querying (Snowflake)
-       └─ APIs (for applications)
-```
-
-### Reliability Features
-```
-Failures Handled:
-✅ API timeout → Exponential backoff + retry
-✅ Schema mismatch → Quarantine + alert
-✅ Data quality drop → Block load + escalate
-✅ Duplicates detected → Automatic deduplication
-✅ Partial source failure → Continue with others
-✅ Task failure → Automatic retry + SLA monitoring
-✅ Warehouse unavailable → Queue and retry
-
-Monitoring:
-✅ Real-time alerts (Slack, email)
-✅ Data quality scorecards
-✅ Pipeline freshness checks
-✅ Cost tracking
-✅ Performance dashboards
-```
-
----
-
-## 💻 Technology Stack
-
-| Component | Technology | Why |
-|-----------|-----------|-----|
-| **Orchestration** | Apache Airflow | DAGs, error handling, monitoring |
-| **Processing** | Apache Spark | Distributed computing, scalable |
-| **Streaming** | Kafka + Spark Streaming | Real-time + micro-batch hybrid |
-| **Warehouse** | Snowflake / BigQuery | SQL analytics, auto-scaling |
-| **Storage** | S3 / GCS | Data lake, cost-effective |
-| **Monitoring** | Prometheus + Grafana | Metrics, alerts |
-| **Logging** | ELK / CloudWatch | Centralized logs, searchable |
-| **IaC** | Terraform | Infrastructure as code |
-| **Container** | Docker + K8s | Reproducible, scalable |
-
----
-
-## 📈 Performance Metrics
-
-### Expected Performance
-- **Ingest time**: 2-3 hours (20 sources in parallel)
-- **Transform time**: 1-1.5 hours (Spark distributed)
-- **Load time**: 15-30 minutes (idempotent bulk load)
-- **Total latency**: 4 hours (target met)
-- **Success rate**: 99.5% (2-3 sources may fail)
-- **Data quality**: 98%+ records pass validation
-
-### Scalability
-- **Handles**: 500GB → 5TB daily (with right-sizing)
-- **Parallelism**: 20 sources simultaneously
-- **Workers**: 4-100 Spark executors (auto-scaling)
-- **Cost**: ~$2-3k/month (optimize below $1k with reserved instances)
-
----
-
-## 🔒 Security Features
-
-- ✅ **Credentials**: Secrets management (HashiCorp Vault, AWS Secrets Manager)
-- ✅ **Encryption**: TLS in-transit, encryption at-rest
-- ✅ **Access Control**: IAM roles, row-level security (RLS)
-- ✅ **Audit Logging**: All access logged, traceable
-- ✅ **Data Privacy**: PII masking, GDPR compliance
-- ✅ **Network**: VPC isolation, no public endpoints
-
----
-
-## 📚 Documentation
-
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Design decisions, trade-offs
-- **[SETUP.md](docs/SETUP.md)** - Local development setup
-- **[DEPLOYMENT.md](docs/DEPLOYMENT.md)** - Production deployment
-- **[OPERATIONS.md](docs/OPERATIONS.md)** - Running and monitoring
-- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Common issues
-- **[API.md](docs/API.md)** - Module reference
-
----
-
-## 🧪 Testing
+### 3. Start all services
 
 ```bash
-# Run all tests
+docker compose up -d
+```
+
+Wait ~30 seconds for health checks to pass, then verify:
+
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}"
+```
+
+Expected output — all services `healthy` (spark-worker and monitoring show `Up`):
+
+```
+pipeline-airflow-webserver   Up ... (healthy)
+pipeline-airflow-scheduler   Up ... (healthy)
+pipeline-postgres            Up ... (healthy)
+pipeline-kafka               Up ... (healthy)
+pipeline-minio               Up ... (healthy)
+pipeline-spark-master        Up ... (healthy)
+pipeline-spark-worker        Up ...
+pipeline-prometheus          Up ...
+pipeline-grafana             Up ...
+```
+
+### 4. Get the Airflow admin password
+
+Airflow 3 auto-generates a password on first start:
+
+```bash
+docker logs pipeline-airflow-webserver 2>&1 | grep "Password for user"
+```
+
+Output example:
+```
+Simple auth manager | Password for user 'admin': seNsfpB5eH3aTnTk
+```
+
+---
+
+## Service URLs
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| **Airflow** | http://localhost:8080 | `admin` / see step 4 above |
+| **Spark Master UI** | http://localhost:8088 | — |
+| **Spark Worker UI** | http://localhost:8081 | — |
+| **MinIO Console** | http://localhost:9001 | `minioadmin` / `minioadmin` |
+| **MinIO API (S3)** | http://localhost:9000 | `minioadmin` / `minioadmin` |
+| **Prometheus** | http://localhost:9090 | — |
+| **Grafana** | http://localhost:3000 | `admin` / `admin` |
+| **Kafka** | `localhost:9092` | — |
+| **PostgreSQL** | `localhost:5432` | `airflow` / `airflow` |
+
+---
+
+## Trigger the pipeline
+
+Once Airflow is up, trigger the daily batch DAG:
+
+```bash
+# Via CLI inside the scheduler container
+docker exec pipeline-airflow-scheduler airflow dags trigger daily_batch_pipeline
+
+# Or open the Airflow UI → DAGs → daily_batch_pipeline → Trigger
+```
+
+The DAG runs: **Ingest → Validate → Transform → Load → Monitor**
+
+---
+
+## Development
+
+```bash
+# Run tests
 poetry run pytest
 
-# Unit tests only
-poetry run pytest tests/ -k "not integration"
-
-# Integration tests
-poetry run pytest tests/integration/
-
-# With coverage
+# Run tests with coverage
 poetry run pytest --cov=src --cov-report=term-missing
 
-# Linting & formatting
+# Lint
 poetry run ruff check src/ tests/
+
+# Format check
 poetry run black --check src/ tests/
+
+# Type check
 poetry run mypy src/
 ```
 
 ---
 
-## 🚢 Deployment
+## Stopping and resetting
 
-### Local (Development)
 ```bash
-docker-compose up -d
-# All services run locally
+# Stop all containers (keep data)
+docker compose down
+
+# Stop and wipe all volumes (full reset)
+docker compose down -v
 ```
 
-### Cloud (AWS EKS)
-```bash
-# See docs/DEPLOYMENT.md for the full Helm + ECR workflow
-bash scripts/setup.sh    # local validation first
-# Then follow the EKS deployment guide
+After a full reset, start from step 3 — Airflow will generate a new admin password.
+
+---
+
+## Project structure
+
+```
+production-data-pipeline/
+├── docker-compose.yml          # All services
+├── pyproject.toml              # Python dependencies (Poetry)
+├── pyrightconfig.json          # IDE type checking config
+│
+├── airflow/
+│   └── dags/
+│       └── daily_batch_pipeline.py   # Main ETL DAG
+│
+├── src/
+│   ├── ingestion/
+│   │   └── base_connector.py   # API, File, Database connectors
+│   ├── validation/
+│   │   └── quality_gates.py    # Null checks, business rules
+│   ├── transformation/         # Spark jobs
+│   ├── warehouse/
+│   │   └── warehouse_loader.py # Idempotent load
+│   └── monitoring/             # Prometheus metrics, alerting
+│
+├── config/
+│   └── prometheus.yml          # Prometheus scrape config
+│
+├── scripts/
+│   └── create_airflow_user.py  # Fallback user creation script
+│
+└── tests/
+    ├── test_ingestion.py
+    ├── test_validation.py
+    └── integration/
 ```
 
 ---
 
-## 📞 Getting Help
+## Architecture
 
-### Common Issues
-See **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** for:
-- Pipeline hanging
-- Data quality failures
-- High costs
-- Performance issues
-
-### Monitoring
-```bash
-# Check pipeline health
-python scripts/monitor_pipeline.py
-
-# View logs
-docker-compose logs -f airflow-scheduler
-
-# Access UIs
-# Airflow: http://localhost:8080
-# Spark: http://localhost:4040
-# Grafana: http://localhost:3000
+```
+20 Data Sources (REST APIs, S3 files, Kafka)
+        │
+        ▼
+  Ingestion Layer          async fetch, retries, schema validation
+        │
+        ▼
+  Validation Layer         null checks, business rules, quality gates (≥95%)
+        │
+        ▼
+  Spark Transform          deduplicate, cleanse, enrich, aggregate
+        │
+        ▼
+  Warehouse Load           idempotent merge (event_id + date)
+        │
+        ▼
+  Monitoring               freshness check, cost tracking, Prometheus metrics
 ```
 
 ---
 
-## 📋 Checklist: Before Production
+## Troubleshooting
 
-- [ ] All tests passing (100% coverage on critical paths)
-- [ ] Security review completed (credentials, network)
-- [ ] Cost optimized ($1-3k/month confirmed)
-- [ ] SLA monitoring configured (alert on >4 hour delay)
-- [ ] Backup/recovery tested (can restore from point-in-time)
-- [ ] Load tested (can handle 500GB+ daily)
-- [ ] Team trained (on-call documentation complete)
-- [ ] Monitoring dashboards live (Grafana, custom alerts)
+**Airflow webserver not healthy**
+```bash
+docker logs pipeline-airflow-webserver --tail 50
+# Health endpoint: http://localhost:8080/api/v2/monitor/health
+```
 
----
+**Postgres container exits immediately**
+```bash
+# If upgrading from a previous version, wipe the volume:
+docker compose down -v
+docker compose up -d
+```
 
-## 🎯 Interview Readiness
+**Kafka unhealthy**
+```bash
+# Test broker connectivity from inside the container:
+docker exec pipeline-kafka kafka-broker-api-versions --bootstrap-server kafka:29092
+```
 
-This project demonstrates:
-- ✅ End-to-end data engineering (ingestion → transformation → warehouse)
-- ✅ Production patterns (idempotency, error handling, monitoring)
-- ✅ Big data processing (Spark, parallel, distributed)
-- ✅ Orchestration (Airflow DAGs, dependencies, SLA)
-- ✅ Data quality (validation, gates, lineage)
-- ✅ Scalability (handles 500GB+, auto-scaling)
-- ✅ Reliability (99.9% uptime, automatic recovery)
-- ✅ Cost optimization (cloud-native, efficient)
-
-**Perfect for:** Data engineer interviews asking about real-world systems
-
----
-
-## 📖 Next Steps
-
-1. **Setup locally**: Follow [SETUP.md](docs/SETUP.md)
-2. **Run pipeline**: Trigger daily_batch_pipeline DAG
-3. **Monitor**: Check dashboards, logs, metrics
-4. **Troubleshoot**: Reference [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
-5. **Deploy to cloud**: Follow [DEPLOYMENT.md](docs/DEPLOYMENT.md)
-6. **Interview prep**: Use project examples in answers
-
----
-
-**Ready to build?** Start with `bash scripts/setup.sh`
+**Poetry using wrong Python version**
+```bash
+mise local python 3.12
+poetry env use $(mise which python)
+poetry install --with dev
+```

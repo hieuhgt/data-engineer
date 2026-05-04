@@ -42,10 +42,35 @@ def ingest_data(**context):
     from src.ingestion.base_connector import APIConnector, FileConnector
 
     connectors = [
-        APIConnector("api_users", {"endpoint": "https://api.example.com/users"}),
-        APIConnector("api_events", {"endpoint": "https://api.example.com/events"}),
+        # Users & social
+        APIConnector("users",           {"endpoint": "https://jsonplaceholder.typicode.com/users"}),
+        APIConnector("posts",           {"endpoint": "https://jsonplaceholder.typicode.com/posts"}),
+        APIConnector("comments",        {"endpoint": "https://jsonplaceholder.typicode.com/comments"}),
+        APIConnector("todos",           {"endpoint": "https://jsonplaceholder.typicode.com/todos"}),
+        APIConnector("albums",          {"endpoint": "https://jsonplaceholder.typicode.com/albums"}),
+        # Random user profiles
+        APIConnector("random_users",    {"endpoint": "https://randomuser.me/api/?results=50"}),
+        # Geography
+        APIConnector("countries",       {"endpoint": "https://restcountries.com/v3.1/all?fields=name,capital,population,region,area"}),
+        # Weather (no key required)
+        APIConnector("weather_nyc",     {"endpoint": "https://api.open-meteo.com/v1/forecast?latitude=40.71&longitude=-74.01&current=temperature_2m,wind_speed_10m"}),
+        APIConnector("weather_london",  {"endpoint": "https://api.open-meteo.com/v1/forecast?latitude=51.51&longitude=-0.13&current=temperature_2m,wind_speed_10m"}),
+        APIConnector("weather_tokyo",   {"endpoint": "https://api.open-meteo.com/v1/forecast?latitude=35.69&longitude=139.69&current=temperature_2m,wind_speed_10m"}),
+        # Crypto prices (no key required)
+        APIConnector("crypto_prices",   {"endpoint": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50"}),
+        APIConnector("crypto_trending", {"endpoint": "https://api.coingecko.com/api/v3/search/trending"}),
+        # Public datasets
+        APIConnector("universities",    {"endpoint": "http://universities.hipolabs.com/search?country=United+States"}),
+        APIConnector("cat_facts",       {"endpoint": "https://catfact.ninja/facts?limit=50"}),
+        APIConnector("dog_breeds",      {"endpoint": "https://dog.ceo/api/breeds/list/all"}),
+        # Space & science
+        APIConnector("nasa_apod",       {"endpoint": "https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&count=10"}),
+        APIConnector("iss_position",    {"endpoint": "http://api.open-notify.org/iss-now.json"}),
+        # HTTP testing
+        APIConnector("ip_info",         {"endpoint": "https://httpbin.org/json"}),
+        APIConnector("user_agents",     {"endpoint": "https://httpbin.org/user-agent"}),
+        # S3 file source (MinIO)
         FileConnector("s3_transactions", {"bucket": "raw-bucket", "prefix": "transactions/"}),
-        # ... add all 20 connectors
     ]
 
     all_data = {}
