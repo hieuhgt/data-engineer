@@ -1,0 +1,58 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: local
+    pipeline: data-engineer
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []   # add alertmanager:9093 in production
+
+rule_files: []
+
+scrape_configs:
+
+  # Prometheus itself
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+  # Airflow metrics (StatsD exporter or Airflow's built-in /metrics)
+  - job_name: airflow
+    static_configs:
+      - targets: [airflow-webserver:8080]
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # Spark master REST API (exposed via JMX exporter sidecar in production)
+  - job_name: spark
+    static_configs:
+      - targets: [spark-master:8080]
+    metrics_path: /metrics/json
+    scrape_interval: 30s
+
+  # Pipeline custom metrics pushed from Python code
+  - job_name: pipeline_pushgateway
+    honor_labels: true
+    static_configs:
+      - targets: [pushgateway:9091]
+
+  # Kafka via JMX exporter (add jmx_exporter container to docker-compose for real use)
+  - job_name: kafka
+    static_configs:
+      - targets: [kafka:7071]
+    scrape_interval: 30s
+
+  # Node exporter – host metrics
+  - job_name: node
+    static_configs:
+      - targets: [node-exporter:9100]
+    scrape_interval: 30s
+
+  # MinIO
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: [minio:9000]

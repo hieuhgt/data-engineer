@@ -1,0 +1,74 @@
+---
+# ConfigMap for Airflow DAGs
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-dags
+  namespace: data-pipeline
+data:
+  daily_data_pipeline_dag.py: |
+    # Inline DAG configuration
+    # In production, mount from persistent volume or Git
+    SCHEDULE_INTERVAL: "0 1 * * *"
+    SLA: 4 hours
+---
+# ConfigMap for pipeline configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  namespace: data-pipeline
+data:
+  S3_BUCKET: "company-datalake"
+  KAFKA_BROKERS: "kafka-0.kafka:9092,kafka-1.kafka:9092,kafka-2.kafka:9092"
+  SPARK_MASTER: "k8s://https://kubernetes.default.svc.cluster.local:443"
+  BRONZE_PATH: "s3a://company-datalake/bronze/"
+  SILVER_PATH: "s3a://company-datalake/silver/"
+  GOLD_PATH: "s3a://company-datalake/gold/"
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  DEBUG: "false"
+---
+# Secret for PostgreSQL (Airflow metadata DB)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: data-pipeline
+type: Opaque
+stringData:
+  password: changeme123
+  database-url: "postgresql://airflow:changeme123@postgres:5432/airflow"
+---
+# Secret for AWS credentials (for S3 access)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials
+  namespace: data-pipeline
+type: Opaque
+stringData:
+  access-key: "YOUR_AWS_ACCESS_KEY"
+  secret-key: "YOUR_AWS_SECRET_KEY"
+---
+# Secret for Kafka (if authentication needed)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kafka-credentials
+  namespace: data-pipeline
+type: Opaque
+stringData:
+  username: "kafka-user"
+  password: "kafka-password"
+---
+# Secret for Airflow
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-secrets
+  namespace: data-pipeline
+type: Opaque
+stringData:
+  fernet-key: "YOUR_GENERATED_FERNET_KEY"
+  database-url: "postgresql://airflow:changeme123@postgres:5432/airflow"

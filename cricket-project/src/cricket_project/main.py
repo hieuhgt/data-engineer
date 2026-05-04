@@ -1,0 +1,70 @@
+from cricket_project.data_processor import DataProcessor
+
+yaml_data = """
+deliveries:
+- ball: 29.1
+  non_striker: JL Smith
+  bowler: B Doggett
+  runs:
+    extras: 0
+    total: 1
+    batsman: 1
+  batsman: HC Brook
+- ball: 29.2
+  non_striker: HC Brook
+  bowler: B Doggett
+  runs:
+    extras: 0
+    total: 3
+    batsman: 3
+  batsman: JL Smith
+- ball: 29.3
+  non_striker: JL Smith
+  bowler: B Doggett
+  runs:
+    extras: 0
+    total: 1
+    batsman: 1
+  batsman: HC Brook
+- ball: 29.4
+  non_striker: HC Brook
+  bowler: B Doggett
+  runs:
+    extras: 0
+    total: 3
+    batsman: 3
+  batsman: JL Smith
+- ball: 29.4
+  non_striker: HC Brook
+  bowler: B Doggett
+  runs:
+    extras: 0
+    total: 3
+    batsman: 3
+  batsman: JL Smith
+- ball: 29.5
+  non_striker: JL Smith
+  bowler: B Doggett
+  runs:
+    extras: 0
+    total: 0
+    batsman: 0
+  batsman: HC Brook
+  wicket:
+    player_out: HC Brook
+    fielders:
+    - AT Carey
+    kind: caught
+- ball: 29.6
+  non_striker: JL Smith
+  bowler: B Doggett
+  runs:
+    extras: 0
+    total: 1
+    batsman: 1
+  batsman: AAP Atkinson
+"""
+
+if __name__ == "__main__":
+    processor = DataProcessor(yaml_data)
+    result = processor.process_batch()

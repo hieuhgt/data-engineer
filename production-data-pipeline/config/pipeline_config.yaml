@@ -1,0 +1,257 @@
+# Production Data Pipeline Configuration
+
+# Data Sources (20 sources)
+sources:
+  - name: "api_users"
+    type: "rest_api"
+    endpoint: "https://api.example.com/users"
+    schedule: "@daily"
+    retries: 3
+    timeout: 30
+    rate_limit: "100/minute"
+    schema:
+      user_id: "integer"
+      name: "string"
+      email: "string"
+      created_at: "timestamp"
+    validation:
+      required_fields: ["user_id", "email"]
+      min_rows: 1000
+    enrichment:
+      join_table: "user_segments"
+      join_key: "user_id"
+
+  - name: "api_events"
+    type: "rest_api"
+    endpoint: "https://api.example.com/events"
+    schedule: "@daily"
+    retries: 3
+    timeout: 30
+    schema:
+      event_id: "string"
+      user_id: "integer"
+      event_type: "string"
+      amount: "decimal"
+      timestamp: "timestamp"
+    validation:
+      required_fields: ["event_id", "user_id", "event_type"]
+      min_rows: 100000
+      quality_gates:
+        - name: "no_negative_amounts"
+          condition: "amount >= 0"
+          threshold: 0.95  # 95% must pass
+        - name: "valid_timestamps"
+          condition: "timestamp > '2020-01-01' AND timestamp <= now()"
+          threshold: 0.99
+
+  - name: "s3_transactions"
+    type: "s3"
+    bucket: "raw-data-bucket"
+    prefix: "transactions/"
+    format: "parquet"
+    schedule: "@daily"
+    schema:
+      transaction_id: "string"
+      user_id: "integer"
+      product_id: "integer"
+      amount: "decimal"
+      date: "date"
+    validation:
+      required_fields: ["transaction_id", "user_id"]
+      deduplication_key: ["transaction_id", "date"]
+
+  - name: "kafka_events"
+    type: "kafka"
+    topic: "raw-events"
+    bootstrap_servers: "kafka:9092"
+    consumer_group: "pipeline-events"
+    schema:
+      event_id: "string"
+      user_id: "integer"
+      properties: "string"  # JSON
+    validation:
+      required_fields: ["event_id"]
+
+  - name: "database_users"
+    type: "postgresql"
+    connection_string: "postgresql://user:pass@postgres:5432/source_db"
+    query: "SELECT * FROM users WHERE updated_at > :last_run"
+    schedule: "@daily"
+    schema:
+      user_id: "integer"
+      email: "string"
+      status: "string"
+    validation:
+      required_fields: ["user_id"]
+
+# Transformation Rules
+transformations:
+  - name: "clean_data"
+    operations:
+      - type: "drop_duplicates"
+        key: ["id", "source"]
+      - type: "remove_nulls"
+        columns: ["user_id", "event_type"]
+      - type: "cast_types"
+        columns:
+          amount: "decimal(10,2)"
+          created_at: "timestamp"
+
+  - name: "enrich_data"
+    operations:
+      - type: "join"
+        table: "user_segments"
+        key: "user_id"
+        how: "left"
+      - type: "join"
+        table: "products"
+        key: "product_id"
+        how: "left"
+
+  - name: "aggregate_metrics"
+    operations:
+      - type: "group_by"
+        columns: ["date", "user_id"]
+        aggregations:
+          total_amount: "sum(amount)"
+          event_count: "count(*)"
+          avg_amount: "avg(amount)"
+
+# Data Quality Gates
+quality_gates:
+  - name: "schema_validation"
+    type: "schema"
+    threshold: 1.0  # 100% must pass
+    alert_level: "critical"
+
+  - name: "business_rules"
+    type: "custom"
+    rules:
+      - "amount > 0"
+      - "date <= current_date"
+    threshold: 0.95
+    alert_level: "warning"
+
+  - name: "freshness"
+    type: "time_based"
+    max_age_hours: 24
+    alert_level: "warning"
+
+  - name: "completeness"
+    type: "null_check"
+    required_columns: ["user_id", "event_type"]
+    threshold: 0.99
+    alert_level: "critical"
+
+# Data Warehouse (Snowflake)
+warehouse:
+  type: "snowflake"
+  connection:
+    account: "xy12345.us-east-1"
+    user: "${SNOWFLAKE_USER}"
+    password: "${SNOWFLAKE_PASSWORD}"
+    database: "analytics"
+    schema: "public"
+
+  tables:
+    - name: "fact_events"
+      type: "fact"
+      partitioned_by: ["date"]
+      cluster_by: ["user_id"]
+      load_strategy: "upsert"  # Idempotent
+      merge_key: ["event_id", "date"]
+
+    - name: "fact_transactions"
+      type: "fact"
+      partitioned_by: ["date"]
+      load_strategy: "upsert"
+      merge_key: ["transaction_id"]
+
+    - name: "dim_users"
+      type: "dimension"
+      load_strategy: "upsert"
+      merge_key: ["user_id"]
+
+    - name: "agg_daily_metrics"
+      type: "aggregate"
+      partitioned_by: ["date"]
+      load_strategy: "replace"  # Full reload daily
+
+# Monitoring & Alerting
+monitoring:
+  metrics:
+    - name: "ingest_rows_processed"
+      type: "gauge"
+      alert: "rows_processed < 10000"
+
+    - name: "ingest_duration_sec"
+      type: "histogram"
+      alert: "p99 > 3600"  # > 1 hour
+
+    - name: "quality_pass_rate"
+      type: "gauge"
+      alert: "pass_rate < 0.95"
+
+    - name: "pipeline_freshness_hours"
+      type: "gauge"
+      alert: "freshness > 4"
+
+  alerts:
+    - name: "sla_miss"
+      condition: "pipeline_duration > 4 hours"
+      notification: ["slack", "email"]
+      severity: "critical"
+
+    - name: "quality_gate_failed"
+      condition: "quality_pass_rate < 0.95"
+      notification: ["slack", "email"]
+      severity: "warning"
+
+    - name: "source_unavailable"
+      condition: "source_error_rate > 0.1"
+      notification: ["slack"]
+      severity: "warning"
+
+  dashboards:
+    - name: "pipeline_health"
+      metrics:
+        - "ingest_rows_processed"
+        - "quality_pass_rate"
+        - "pipeline_freshness_hours"
+
+    - name: "cost_tracking"
+      metrics:
+        - "compute_cost_hourly"
+        - "storage_cost_daily"
+        - "data_processed_gb"
+
+# Data Lineage Tracking
+lineage:
+  enabled: true
+  log_level: "info"
+  track_columns: true
+
+# Cost Optimization
+cost_optimization:
+  compute:
+    auto_scale: true
+    min_executors: 4
+    max_executors: 20
+    instance_type: "m5.xlarge"
+    spot_instances: true
+
+  storage:
+    s3_class: "STANDARD_IA"  # Infrequent access
+    archive_older_than_days: 365
+    compression: "gzip"
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "json"
+  handlers:
+    - type: "cloudwatch"
+      log_group: "/data-pipeline/logs"
+    - type: "file"
+      path: "/var/log/data-pipeline/"
+      retention_days: 30

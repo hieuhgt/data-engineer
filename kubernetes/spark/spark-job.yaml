@@ -1,0 +1,121 @@
+---
+# Example Spark Job Pod (submitted by Airflow)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spark-etl-job
+  namespace: data-pipeline
+  labels:
+    app: spark
+    job: etl
+spec:
+  serviceAccountName: spark
+  restartPolicy: Never
+  containers:
+  - name: spark-driver
+    image: your-registry/spark-etl:latest
+    imagePullPolicy: Always
+    args:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - k8s://https://kubernetes.default.svc.cluster.local:443
+      - --deploy-mode
+      - client
+      - --conf
+      - spark.driver.cores=2
+      - --conf
+      - spark.driver.memory=2g
+      - --conf
+      - spark.executor.cores=2
+      - --conf
+      - spark.executor.memory=2g
+      - --conf
+      - spark.executor.instances=3
+      - --conf
+      - spark.kubernetes.container.image=your-registry/spark-etl:latest
+      - --conf
+      - spark.kubernetes.namespace=data-pipeline
+      - --conf
+      - spark.kubernetes.authenticate.driver.serviceAccountName=spark
+      - --conf
+      - spark.kubernetes.authenticate.executor.serviceAccountName=spark
+      - /opt/spark/jobs/bronze_to_silver.py
+    env:
+    - name: BRONZE_PATH
+      value: s3a://company-datalake/bronze/events/2024-04-22/
+    - name: SILVER_PATH
+      value: s3a://company-datalake/silver/events/2024-04-22/
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: aws-credentials
+          key: access-key
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: aws-credentials
+          key: secret-key
+    - name: AWS_REGION
+      value: us-east-1
+    resources:
+      requests:
+        cpu: 2
+        memory: 2Gi
+      limits:
+        cpu: 4
+        memory: 4Gi
+    volumeMounts:
+    - name: spark-logs
+      mountPath: /opt/spark/work-dir
+  volumes:
+  - name: spark-logs
+    emptyDir: {}
+---
+# Simpler variant: Spark Batch Job using spark-submit
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-batch-job
+  namespace: data-pipeline
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      serviceAccountName: spark
+      restartPolicy: Never
+      containers:
+      - name: spark-submit
+        image: your-registry/spark-etl:latest
+        command:
+          - /opt/spark/bin/spark-submit
+          - --master
+          - local[4]
+          - --deploy-mode
+          - client
+          - --driver-memory
+          - 2g
+          - --executor-memory
+          - 2g
+          - /opt/spark/jobs/bronze_to_silver.py
+        env:
+        - name: BRONZE_PATH
+          value: s3a://company-datalake/bronze/events/2024-04-22/
+        - name: SILVER_PATH
+          value: s3a://company-datalake/silver/events/2024-04-22/
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: access-key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: secret-key
+        resources:
+          requests:
+            cpu: 2
+            memory: 2Gi
+          limits:
+            cpu: 4
+            memory: 4Gi

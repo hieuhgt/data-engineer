@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "kafka-streaming"
+version = "0.1.0"
+description = "Kafka producer/consumer toolkit with streaming patterns"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.9"
+kafka-python = "^2.0.2"
+python-dotenv = "^1.0.0"
+loguru = "^0.7.2"
+pydantic = "^2.0.0"
+confluent-kafka = "^2.2.0"  # Optional: alternative to kafka-python
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+black = "^23.0.0"
+mypy = "^1.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

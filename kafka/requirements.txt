@@ -1,0 +1,5 @@
+# Kafka component dependencies
+-r ../requirements/base.txt
+
+kafka-python==2.0.2
+great-expectations==0.17.12
