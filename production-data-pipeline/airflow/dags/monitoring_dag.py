@@ -13,15 +13,13 @@ default_args = {
     "owner": "data-platform",
     "start_date": datetime(2024, 1, 1),
     "retries": 0,
-    "email_on_failure": True,
-    "email": ["data-team@company.com"],
 }
 
 dag = DAG(
     "pipeline_health_monitor",
     default_args=default_args,
     description="Hourly data freshness and quality check",
-    schedule_interval="@hourly",
+    schedule="@hourly",
     tags=["monitoring"],
     catchup=False,
 )
@@ -80,14 +78,12 @@ def check_row_counts(**context):
 freshness_check = PythonOperator(
     task_id="check_freshness",
     python_callable=check_data_freshness,
-    provide_context=True,
     dag=dag,
 )
 
 row_count_check = PythonOperator(
     task_id="check_row_counts",
     python_callable=check_row_counts,
-    provide_context=True,
     dag=dag,
 )
 

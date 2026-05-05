@@ -21,14 +21,21 @@ services:
 
   # Airflow Scheduler
   airflow-scheduler:
-    image: apache/airflow:3.2.1-python3.12
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     container_name: pipeline-airflow-scheduler
+    hostname: airflow-scheduler
     command: scheduler
     environment:
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "True"
+      AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+      AIRFLOW__API__BASE_URL: "http://airflow-webserver:8080"
+      AIRFLOW__API_AUTH__JWT_SECRET: "2FMy0AOAeXhLx-HFvAcKrc10g9gNFgXljUOEk8xiun17QWBup2e-di2wwr8Fnh6cCYYT5cmwi9SuPz_edTM91g=="
+      PYTHONPATH: "/opt/airflow"
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,6 +44,7 @@ services:
       - ./airflow/plugins:/opt/airflow/plugins
       - ./config:/opt/airflow/config
       - ./src:/opt/airflow/src
+      - airflow_logs:/opt/airflow/logs
     networks:
       - pipeline
     healthcheck:
@@ -47,13 +55,16 @@ services:
 
   # Airflow API Server (replaces webserver in Airflow 3.x)
   airflow-webserver:
-    image: apache/airflow:3.2.1-python3.12
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     container_name: pipeline-airflow-webserver
     command: api-server
     environment:
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__API_AUTH__JWT_SECRET: "2FMy0AOAeXhLx-HFvAcKrc10g9gNFgXljUOEk8xiun17QWBup2e-di2wwr8Fnh6cCYYT5cmwi9SuPz_edTM91g=="
     depends_on:
       - postgres
     ports:
@@ -63,6 +74,7 @@ services:
       - ./airflow/plugins:/opt/airflow/plugins
       - ./config:/opt/airflow/config
       - ./src:/opt/airflow/src
+      - airflow_logs:/opt/airflow/logs
     networks:
       - pipeline
     healthcheck:
@@ -185,6 +197,7 @@ volumes:
   minio_data:
   prometheus_data:
   grafana_data:
+  airflow_logs:
 
 networks:
   pipeline:

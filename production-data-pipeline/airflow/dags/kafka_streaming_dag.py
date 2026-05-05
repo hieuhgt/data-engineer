@@ -16,15 +16,13 @@ default_args = {
     "start_date": datetime(2024, 1, 1),
     "retries": 1,
     "retry_delay": timedelta(minutes=2),
-    "email_on_failure": True,
-    "email": ["data-team@company.com"],
 }
 
 dag = DAG(
     "kafka_streaming_monitor",
     default_args=default_args,
     description="Monitor Kafka consumer lag for streaming pipeline",
-    schedule_interval="*/15 * * * *",  # Every 15 minutes
+    schedule="*/15 * * * *",  # Every 15 minutes
     tags=["streaming", "monitoring"],
     catchup=False,
 )
@@ -61,14 +59,12 @@ def alert_if_lagging(**context):
 check_lag = PythonOperator(
     task_id="check_lag",
     python_callable=check_consumer_lag,
-    provide_context=True,
     dag=dag,
 )
 
 evaluate_lag = PythonOperator(
     task_id="evaluate_lag",
     python_callable=alert_if_lagging,
-    provide_context=True,
     dag=dag,
 )
 

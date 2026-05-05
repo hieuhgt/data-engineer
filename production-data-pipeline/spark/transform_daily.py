@@ -23,8 +23,14 @@ def main(date: str):
     logger.info(f"Starting daily transform for {date}")
     spark = get_spark("DailyTransform")
 
+    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.endpoint", "http://minio:9000")
+    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.access.key", "minioadmin")
+    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.secret.key", "minioadmin")
+    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.path.style.access", "true")
+    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+
     # --- BRONZE: read raw ingested data ---
-    raw_path = f"s3://data-lake/bronze/events/date={date}/"
+    raw_path = f"s3a://raw-bucket/*/date={date}/data.parquet"
     try:
         raw = spark.read.parquet(raw_path)
         logger.info(f"Loaded {raw.count()} raw rows from {raw_path}")
@@ -40,7 +46,7 @@ def main(date: str):
     silver = transformer.add_audit_columns(silver, source="events_api")
     silver = silver.withColumn("event_date", F.to_date(F.col("timestamp")))
 
-    silver_path = f"s3://data-lake/silver/events/date={date}/"
+    silver_path = f"s3a://processed-bucket/silver/date={date}/"
     silver.write.mode("overwrite").parquet(silver_path)
     logger.info(f"Silver layer written: {silver.count()} rows → {silver_path}")
 
@@ -49,7 +55,7 @@ def main(date: str):
     enriched = enricher.enrich_with_user_segments(silver, "s3://data-lake/dims/user_segments/")
 
     gold = daily_user_metrics(enriched, date_col="event_date")
-    gold_path = f"s3://data-lake/gold/daily_user_metrics/date={date}/"
+    gold_path = f"s3a://processed-bucket/gold/date={date}/"
     gold.write.mode("overwrite").parquet(gold_path)
     logger.info(f"Gold layer written: {gold.count()} rows → {gold_path}")
 
