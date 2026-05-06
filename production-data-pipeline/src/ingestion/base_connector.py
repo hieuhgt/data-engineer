@@ -3,7 +3,7 @@
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Iterator
 import json
 
 logger = logging.getLogger(__name__)
@@ -95,35 +95,79 @@ class APIConnector(DataConnector):
         self.endpoint = config.get('endpoint')
         self.retries = config.get('retries', 3)
         self.timeout = config.get('timeout', 30)
+        self.page_size = config.get('page_size', 1000)
 
-    def fetch(self) -> List[Dict]:
-        """Fetch from REST API with retries"""
-        import aiohttp
-        import asyncio
-        from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
-
-        async def fetch_async():
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(self.retries),
-                wait=wait_exponential(multiplier=1, min=2, max=10),
-            ):
-                with attempt:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            self.endpoint,
-                            timeout=aiohttp.ClientTimeout(total=self.timeout)
-                        ) as response:
-                            if response.status != 200:
-                                raise ValueError(f"HTTP {response.status}")
-                            return await response.json()
-
-        data = asyncio.run(fetch_async())
-        if isinstance(data, dict) and 'data' in data:
+    def _parse_response(self, data) -> List[Dict]:
+        data_key = self.config.get('data_key')
+        if data_key and isinstance(data, dict) and data_key in data:
+            return data[data_key]
+        elif isinstance(data, dict) and 'data' in data:
             return data['data']
         elif isinstance(data, list):
             return data
         else:
             return [data]
+
+    def fetch(self) -> List[Dict]:
+        """Fetch all data (single request). Use fetch_pages() for large datasets."""
+        import aiohttp
+        import asyncio
+
+        async def fetch_async():
+            for attempt in range(self.retries):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            self.endpoint,
+                            params=self.config.get('params', {}),
+                            timeout=aiohttp.ClientTimeout(total=self.timeout),
+                        ) as response:
+                            if response.status != 200:
+                                raise ValueError(f"HTTP {response.status}")
+                            return await response.json()
+                except Exception as e:
+                    if attempt == self.retries - 1:
+                        raise
+                    logger.warning(f"Retry {attempt + 1}/{self.retries}: {e}")
+
+        return self._parse_response(asyncio.run(fetch_async()))
+
+    def fetch_pages(self) -> Iterator[List[Dict]]:
+        """
+        Yield one page at a time using limit/skip params (offset-based pagination).
+        Avoids loading the full dataset into memory — use for large sources.
+        Stops when the API returns fewer records than page_size (last page).
+        """
+        import aiohttp
+        import asyncio
+
+        async def fetch_page(skip: int) -> List[Dict]:
+            params = {**self.config.get('params', {}), 'limit': self.page_size, 'skip': skip}
+            for attempt in range(self.retries):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            self.endpoint,
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=self.timeout),
+                        ) as response:
+                            if response.status != 200:
+                                raise ValueError(f"HTTP {response.status}")
+                            return self._parse_response(await response.json())
+                except Exception as e:
+                    if attempt == self.retries - 1:
+                        raise
+                    logger.warning(f"[{self.name}] skip={skip} retry {attempt + 1}: {e}")
+
+        skip = 0
+        while True:
+            data = asyncio.run(fetch_page(skip))
+            if not data:
+                break
+            yield data
+            if len(data) < self.page_size:
+                break  # partial page = last page
+            skip += self.page_size
 
     def validate_schema(self, data: List[Dict]) -> bool:
         """Validate API response schema"""

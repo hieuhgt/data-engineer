@@ -1,16 +1,68 @@
 # Daily Batch Data Pipeline DAG
-# Orchestrates: Ingest → Validate → Transform → Load
+# Orchestrates: Ingest → Validate → Confirm → Transform → Load → Monitor
+
+import logging
+from datetime import datetime, timedelta
+from io import BytesIO
+
+import boto3
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from botocore.exceptions import ClientError
 
 from airflow import DAG
 from airflow.sdk import task_group
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-from datetime import datetime, timedelta
-import logging
+
+from src.ingestion.base_connector import APIConnector
+from src.warehouse.warehouse_loader import idempotent_load
 
 logger = logging.getLogger(__name__)
 
+MINIO_ENDPOINT = 'http://minio:9000'
+MINIO_ACCESS_KEY = 'minioadmin'
+MINIO_SECRET_KEY = 'minioadmin'
+RAW_BUCKET = 'raw-bucket'
+PROCESSED_BUCKET = 'processed-bucket'
+REQUIRED_FIELDS = ['id', 'firstName', 'email']
+
+
+def _s3_client():
+    return boto3.client(
+        's3',
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+    )
+
+
+def _ensure_bucket(s3, bucket: str):
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except ClientError:
+        s3.create_bucket(Bucket=bucket)
+        logger.info(f"Created bucket '{bucket}'")
+
+
+def _read_parquet_from_prefix(s3, bucket: str, prefix: str) -> list[pd.DataFrame]:
+    dfs = []
+    response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    for obj in response.get('Contents', []):
+        if not obj['Key'].endswith('.parquet') or obj['Size'] == 0:
+            continue
+        buf = BytesIO()
+        s3.download_fileobj(bucket, obj['Key'], buf)
+        buf.seek(0)
+        dfs.append(pd.read_parquet(buf))
+    return dfs
+
+
+# ---------------------------------------------------------------------------
 # Default arguments
+# ---------------------------------------------------------------------------
+
 default_args = {
     'owner': 'data-platform',
     'start_date': datetime(2024, 1, 1),
@@ -18,222 +70,162 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# DAG definition
 dag = DAG(
     'daily_batch_pipeline',
     default_args=default_args,
     description='Daily batch ETL pipeline: ingest → validate → transform → load',
-    schedule='0 0 * * *',  # Daily at midnight UTC
+    schedule='0 0 * * *',
     tags=['production', 'batch', 'daily'],
     catchup=False,
 )
 
+# ---------------------------------------------------------------------------
 # Tasks
+# ---------------------------------------------------------------------------
 
 def ingest_data(**context):
-    """Ingest data from 20 sources"""
+    """
+    Fetch data page by page and write directly to MinIO as Parquet chunks.
+    Only MinIO paths (not data) are pushed to XCom — scales to millions of records.
+    """
     ds = context.get('ds') or datetime.now().strftime('%Y-%m-%d')
     logger.info(f"Starting ingestion for {ds}")
 
-    # In production: Load from config
-    from src.ingestion.base_connector import APIConnector, FileConnector
+    s3 = _s3_client()
+    _ensure_bucket(s3, RAW_BUCKET)
 
     connectors = [
-        # Users & social
-        APIConnector("users",           {"endpoint": "https://jsonplaceholder.typicode.com/users"})
-        # APIConnector("posts",           {"endpoint": "https://jsonplaceholder.typicode.com/posts"}),
-        # APIConnector("comments",        {"endpoint": "https://jsonplaceholder.typicode.com/comments"}),
-        # APIConnector("todos",           {"endpoint": "https://jsonplaceholder.typicode.com/todos"}),
-        # APIConnector("albums",          {"endpoint": "https://jsonplaceholder.typicode.com/albums"}),
-        # # Random user profiles
-        # APIConnector("random_users",    {"endpoint": "https://randomuser.me/api/?results=50"}),
-        # # Geography
-        # APIConnector("countries",       {"endpoint": "https://restcountries.com/v3.1/all?fields=name,capital,population,region,area"}),
-        # # Weather (no key required)
-        # APIConnector("weather_nyc",     {"endpoint": "https://api.open-meteo.com/v1/forecast?latitude=40.71&longitude=-74.01&current=temperature_2m,wind_speed_10m"}),
-        # APIConnector("weather_london",  {"endpoint": "https://api.open-meteo.com/v1/forecast?latitude=51.51&longitude=-0.13&current=temperature_2m,wind_speed_10m"}),
-        # APIConnector("weather_tokyo",   {"endpoint": "https://api.open-meteo.com/v1/forecast?latitude=35.69&longitude=139.69&current=temperature_2m,wind_speed_10m"}),
-        # # Crypto prices (no key required)
-        # APIConnector("crypto_prices",   {"endpoint": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50"}),
-        # APIConnector("crypto_trending", {"endpoint": "https://api.coingecko.com/api/v3/search/trending"}),
-        # # Public datasets
-        # APIConnector("universities",    {"endpoint": "http://universities.hipolabs.com/search?country=United+States"}),
-        # APIConnector("cat_facts",       {"endpoint": "https://catfact.ninja/facts?limit=50"}),
-        # APIConnector("dog_breeds",      {"endpoint": "https://dog.ceo/api/breeds/list/all"}),
-        # # Space & science
-        # APIConnector("nasa_apod",       {"endpoint": "https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&count=10"}),
-        # APIConnector("iss_position",    {"endpoint": "http://api.open-notify.org/iss-now.json"}),
-        # # HTTP testing
-        # APIConnector("ip_info",         {"endpoint": "https://httpbin.org/json"}),
-        # APIConnector("user_agents",     {"endpoint": "https://httpbin.org/user-agent"}),
-        # S3 file source (MinIO)
-        # FileConnector("s3_transactions", {"bucket": "raw-bucket", "prefix": "transactions/"}),
+        APIConnector("users", {
+            "endpoint": "https://dummyjson.com/users",
+            "data_key": "users",   # response: {"users": [...], "total": 208}
+            "page_size": 100,      # 208 total → 3 pages: 100 + 100 + 8
+        }),
     ]
 
-    all_data = {}
+    staging_paths = {}
     failed_sources = []
 
     for connector in connectors:
         try:
-            data, lineage = connector.execute()
-            all_data[connector.name] = {'data': data, 'lineage': lineage}
-            logger.info(f"✓ Ingested {len(data)} rows from {connector.name}")
+            total_rows = 0
+            for page_num, page_data in enumerate(connector.fetch_pages()):
+                table = pa.Table.from_pandas(pd.DataFrame(page_data))
+                buf = BytesIO()
+                pq.write_table(table, buf)
+                buf.seek(0)
+                key = f"{connector.name}/date={ds}/part-{page_num:05d}.parquet"
+                s3.put_object(Bucket=RAW_BUCKET, Key=key, Body=buf.getvalue())
+                total_rows += len(page_data)
+                logger.info(f"  {connector.name} page {page_num}: {len(page_data)} rows → {key}")
+
+            staging_paths[connector.name] = {
+                'prefix': f"{connector.name}/date={ds}/",
+                'rows': total_rows,
+            }
+            logger.info(f"✓ {connector.name}: {total_rows} rows written to s3://{RAW_BUCKET}/")
         except Exception as e:
-            logger.error(f"✗ Failed to ingest from {connector.name}: {e}")
+            logger.error(f"✗ {connector.name}: {e}")
             failed_sources.append(connector.name)
 
-    # Check: Allow partial failure (continue if < 3 sources fail)
     if len(failed_sources) > 3:
-        raise ValueError(f"Too many source failures ({len(failed_sources)}): {failed_sources}")
+        raise ValueError(f"Too many source failures: {failed_sources}")
 
-    logger.info(f"Ingestion complete: {len(all_data)} sources succeeded, {len(failed_sources)} failed")
-
-    # Store in XCom for next task
-    context['task_instance'].xcom_push(key='ingested_data', value=all_data)
+    logger.info(f"Ingestion complete: {len(staging_paths)} sources, {len(failed_sources)} failed")
+    context['task_instance'].xcom_push(key='staging_paths', value=staging_paths)
     context['task_instance'].xcom_push(key='failed_sources', value=failed_sources)
-
-    return {'success_count': len(all_data), 'failure_count': len(failed_sources)}
+    return {'success_count': len(staging_paths), 'failure_count': len(failed_sources)}
 
 
 def validate_data(**context):
-    """Validate data quality"""
+    """
+    Read Parquet from MinIO and validate using pandas vectorized operations.
+    No Python loops over rows — scales to millions of records.
+    """
     ti = context['task_instance']
-    ingested_data = ti.xcom_pull(task_ids='ingestion_group.ingest_data', key='ingested_data')
-    from src.validation.quality_gates import (
-        NullCheckGate,
-        BusinessRuleGate,
-        QualityGateChecker
-    )
+    staging_paths = ti.xcom_pull(task_ids='ingestion_group.ingest_data', key='staging_paths')
 
-    # Create quality gates
-    gates = [
-        NullCheckGate(required_fields=['id', 'name', 'email']),
-        # BusinessRuleGate(rules={'positive_amount': 'amount > 0'}),
-    ]
+    if not staging_paths:
+        raise ValueError("No staging paths from ingest step")
 
-    checker = QualityGateChecker(gates)
-
-    # Validate all ingested data
+    s3 = _s3_client()
     validation_results = {}
-    for source_name, source_data in ingested_data.items():
-        data = source_data['data']
-        _, results = checker.validate_all(data)
-        validation_results[source_name] = {
-            'quality_score': checker.get_quality_score(),
-            'passed': all(r.passed for r in results)
-        }
-        logger.info(f"{source_name}: quality_score={checker.get_quality_score():.1%}")
 
-    # Check: Fail if quality < 95%
+    for source_name, info in staging_paths.items():
+        prefix = info['prefix']
+        dfs = _read_parquet_from_prefix(s3, RAW_BUCKET, prefix)
+
+        if not dfs:
+            validation_results[source_name] = {
+                'passed': False, 'quality_score': 0.0, 'rows': 0, 'prefix': prefix,
+            }
+            continue
+
+        df = pd.concat(dfs, ignore_index=True)
+
+        # Vectorized null check across all required columns at once
+        existing = [f for f in REQUIRED_FIELDS if f in df.columns]
+        if existing:
+            fail_count = int(df[existing].isnull().any(axis=1).sum())
+            pass_rate = 1.0 - (fail_count / len(df))
+        else:
+            pass_rate = 1.0
+
+        passed = pass_rate >= 0.99
+        validation_results[source_name] = {
+            'passed': passed,
+            'quality_score': float(pass_rate),
+            'rows': len(df),
+            'prefix': prefix,
+        }
+        logger.info(f"{source_name}: {len(df):,} rows | quality={pass_rate:.1%} | passed={passed}")
+
     overall_quality = sum(r['quality_score'] for r in validation_results.values()) / len(validation_results)
     if overall_quality < 0.95:
-        raise ValueError(f"Data quality below threshold: {overall_quality:.1%} < 95%")
+        raise ValueError(f"Data quality below threshold: {overall_quality:.1%}")
 
     ti.xcom_push(key='validation_results', value=validation_results)
     logger.info(f"Validation passed: overall quality = {overall_quality:.1%}")
 
 
 def save_to_minio(**context):
-    """Write validated source data as Parquet to MinIO raw-bucket"""
-    import boto3
-    import pandas as pd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    from io import BytesIO
-    from botocore.exceptions import ClientError
-
+    """
+    Data is already written to MinIO by ingest_data (page by page).
+    This step confirms which sources passed validation and are ready for Spark.
+    """
     ti = context['task_instance']
-    ds = context.get('ds') or datetime.now().strftime('%Y-%m-%d')
-
-    ingested_data = ti.xcom_pull(task_ids='ingestion_group.ingest_data', key='ingested_data')
     validation_results = ti.xcom_pull(task_ids='validation_group.validate_data', key='validation_results')
 
-    if not ingested_data or not validation_results:
-        logger.warning("No ingested data or validation results found; skipping MinIO save")
-        ti.xcom_push(key='minio_save_result', value={'sources_saved': [], 'base_path': 's3://raw-bucket'})
+    if not validation_results:
+        logger.warning("No validation results; skipping")
+        ti.xcom_push(key='minio_save_result', value={'sources_saved': [], 'base_path': f's3://{RAW_BUCKET}'})
         return
 
-    s3 = boto3.client(
-        's3',
-        endpoint_url='http://minio:9000',
-        aws_access_key_id='minioadmin',
-        aws_secret_access_key='minioadmin',
-    )
+    sources_saved = [s for s, r in validation_results.items() if r.get('passed')]
+    skipped = [s for s, r in validation_results.items() if not r.get('passed')]
 
-    bucket = 'raw-bucket'
-    try:
-        s3.head_bucket(Bucket=bucket)
-    except ClientError:
-        s3.create_bucket(Bucket=bucket)
-        logger.info(f"Created bucket {bucket}")
+    if skipped:
+        logger.warning(f"Skipped (failed validation): {skipped}")
 
-    sources_saved = []
-    for source_name, result in validation_results.items():
-        if not result.get('passed'):
-            logger.info(f"Skipping {source_name}: validation did not pass")
-            continue
-
-        rows = ingested_data.get(source_name, {}).get('data', [])
-        df = pd.DataFrame(rows)
-        table = pa.Table.from_pandas(df)
-        buf = BytesIO()
-        pq.write_table(table, buf)
-        buf.seek(0)
-
-        key = f"{source_name}/date={ds}/data.parquet"
-        s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
-        logger.info(f"Wrote {len(df)} rows to s3://{bucket}/{key}")
-        sources_saved.append(source_name)
-
-    ti.xcom_push(key='minio_save_result', value={'sources_saved': sources_saved, 'base_path': 's3://raw-bucket'})
-    logger.info(f"MinIO save complete: {len(sources_saved)} sources written")
-
-
-def transform_data(**context):
-    """Submit Spark transformation job"""
-    ds = context.get('ds') or datetime.now().strftime('%Y-%m-%d')
-    logger.info(f"Starting transformation for {ds}")
-
-    # Spark job will handle:
-    # - Deduplication
-    # - Cleansing (nulls, types)
-    # - Enrichment (joins)
-    # - Aggregation
-
-    # Return job ID for tracking
-    return {'spark_job_id': 'job_12345', 'status': 'submitted'}
+    logger.info(f"Ready for Spark: {sources_saved}")
+    ti.xcom_push(key='minio_save_result', value={
+        'sources_saved': sources_saved,
+        'base_path': f's3://{RAW_BUCKET}',
+    })
 
 
 def load_data(**context):
-    """Load gold layer from MinIO into warehouse"""
-    import boto3
-    import pandas as pd
-    from io import BytesIO
-
-    from src.warehouse.warehouse_loader import idempotent_load
-
+    """Load gold layer from MinIO into warehouse."""
     ds = context.get('ds') or datetime.now().strftime('%Y-%m-%d')
     logger.info(f"Loading gold data for {ds}")
 
-    s3 = boto3.client(
-        's3',
-        endpoint_url='http://minio:9000',
-        aws_access_key_id='minioadmin',
-        aws_secret_access_key='minioadmin',
-    )
-
-    # Read all Parquet files in the gold partition
+    s3 = _s3_client()
     prefix = f"gold/date={ds}/"
     records = []
+
     try:
-        response = s3.list_objects_v2(Bucket='processed-bucket', Prefix=prefix)
-        for obj in response.get('Contents', []):
-            if not obj['Key'].endswith('.parquet') or obj['Size'] == 0:
-                continue
-            buf = BytesIO()
-            s3.download_fileobj('processed-bucket', obj['Key'], buf)
-            buf.seek(0)
-            records.extend(pd.read_parquet(buf).to_dict('records'))
+        dfs = _read_parquet_from_prefix(s3, PROCESSED_BUCKET, prefix)
+        for df in dfs:
+            records.extend(df.to_dict('records'))
     except Exception as e:
         logger.warning(f"Could not read gold data from MinIO: {e}")
 
@@ -241,40 +233,27 @@ def load_data(**context):
         logger.warning("No gold data found — skipping warehouse load")
         return {'table': 'dim_users', 'rows_loaded': 0, 'merge_key': ['id']}
 
-    load_result = idempotent_load(
-        source_data=records,
-        target_table='dim_users',
-        merge_key=['id'],
-    )
-
+    load_result = idempotent_load(source_data=records, target_table='dim_users', merge_key=['id'])
     logger.info(f"Loaded {load_result['rows_loaded']} rows to warehouse")
     return load_result
 
 
 def monitor_pipeline(**context):
-    """Post-load monitoring and alerts"""
-    ti = context['task_instance']
+    """Post-load monitoring and alerts."""
     ds = context.get('ds') or datetime.now().strftime('%Y-%m-%d')
-
     logger.info(f"Running post-load monitoring for {ds}")
 
-    # Check: Data freshness
-    # - Warehouse has latest data
-    # - Lineage documented
-    # - Quality score > 95%
-
-    freshness_hours = 0.5  # Loaded 30 minutes ago
+    freshness_hours = 0.5
     if freshness_hours > 4:
         logger.warning(f"Data freshness warning: {freshness_hours} hours")
-
-    # Check: Cost tracking
-    # - Compute cost for this run
-    # - Storage usage
 
     logger.info("Pipeline monitoring complete")
 
 
-# Define task structure
+# ---------------------------------------------------------------------------
+# DAG structure
+# ---------------------------------------------------------------------------
+
 with dag:
     @task_group()
     def ingestion_group():
@@ -319,15 +298,4 @@ with dag:
         trigger_rule='all_success',
     )
 
-    # ingest → validate → save_to_minio → transform → load → monitor
     ingestion_group() >> validation_group() >> save_to_minio_task >> transform_task >> load_task >> monitor_task
-
-# SLA monitoring
-# If pipeline exceeds 4 hours, Airflow alerts automatically
-# Callback on SLA miss
-def sla_miss_callback(dag, task_list, blocking_task_list, slas, blocking_tis):
-    logger.error(f"SLA miss detected for tasks: {[t.task_id for t in task_list]}")
-    # Send Slack alert, PagerDuty, etc.
-    pass
-
-# Note: SLA callback would be added to DAG config in production

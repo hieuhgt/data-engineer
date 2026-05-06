@@ -1,10 +1,10 @@
 # Production Data Pipeline
 
-A production-grade data pipeline: ingests 500 GB/day from 20 sources, transforms with Spark, orchestrates with Airflow, stores in MinIO (S3-compatible), and exposes metrics via Prometheus + Grafana.
+A production-grade data pipeline built to scale: ingests data from multiple sources, streams events via Kafka, transforms with Spark, orchestrates with Airflow, stores in MinIO (S3-compatible), and exposes metrics via Prometheus + Grafana.
 
 **Stack**: Airflow 3 · Spark 4 · Kafka (KRaft) · PostgreSQL 18 · MinIO · Prometheus · Grafana  
-**SLA**: 4-hour batch window  
-**Pattern**: Lambda (batch + streaming)
+**Pattern**: Lambda (batch + streaming)  
+**Scale**: Designed to handle millions of records per day
 
 ---
 
@@ -20,93 +20,114 @@ A production-grade data pipeline: ingests 500 GB/day from 20 sources, transforms
 
 ## How it works
 
-The project has three Airflow DAGs, each with a different job. Here is what each one does and how they fit together.
+The project has three Airflow DAGs, each with a different job.
 
 ---
 
 ### DAG 1 — `daily_batch_pipeline` (runs every day at midnight)
 
-This is the main pipeline. It moves data from 20 external sources all the way to the warehouse every day.
+This is the main pipeline. It moves data from external sources all the way to the warehouse every day, designed to scale to millions of records.
 
 ```
-[20 Data Sources]
-       │
-       ▼
-  1. Ingest        Fetch data from all 20 sources in parallel (REST APIs + S3 files).
-                   Allowed to have up to 3 source failures before the whole job fails.
-                   Saves raw data to XCom for the next step.
-       │
-       ▼
-  2. Validate      Run quality gates on every source:
-                   - Null check: required fields (id, user_id) must not be empty
-                   - Business rule: amount must be > 0
-                   If overall quality score drops below 95%, the pipeline stops here
-                   and does not load bad data to the warehouse.
-       │
-       ▼
-  3. Save to MinIO  For each source that passed validation, convert data to Parquet
-                   and write to MinIO at:
-                     s3://raw-bucket/{source_name}/date=YYYY-MM-DD/data.parquet
-                   This is the handoff point from Python-land to Spark-land.
-                   Sources that failed validation are skipped — bad data never reaches storage.
-       │
-       ▼
-  4. Transform     Submit a Spark job (spark/transform_daily.py) to the Spark cluster.
-                   Spark reads from s3://raw-bucket/*/date=YYYY-MM-DD/ (all sources),
-                   applies a three-layer medallion pattern:
-                     Bronze → Silver (cleanse, cast, deduplicate)
-                     Silver → Gold (enrich, aggregate daily metrics)
-                   Outputs written back to MinIO at s3://processed-bucket/silver/ and /gold/
-       │
-       ▼
-  5. Load          Read the Spark output and load it into the warehouse using an
-                   idempotent MERGE (safe to retry — running it twice gives the same
-                   result). Merge key is event_id + date.
-       │
-       ▼
+[Data Sources (REST APIs)]
+  Source: https://dummyjson.com/users — 208 users total
+        │
+        ▼
+  1. Ingest        Fetch data page by page (100 rows/page, offset-based: limit/skip).
+                   208 users → 3 pages: skip=0 (100), skip=100 (100), skip=200 (8).
+                   Each page is written directly to MinIO as Parquet — nothing
+                   is held in memory. Supports up to 3 source failures before
+                   the whole job fails.
+                   XCom carries only MinIO paths (a few bytes), not the data.
+        │
+        ▼  XCom: { "users": { "prefix": "users/date=.../", "rows": 208 } }
+        ▼
+  2. Validate      Read Parquet files from MinIO and run vectorized null checks
+                   using pandas (no Python loops over rows — scales to 1M+).
+                   Required fields: id, firstName, email.
+                   If overall quality drops below 95%, the pipeline stops here.
+                   XCom carries only small metadata (quality scores, row counts).
+        │
+        ▼  XCom: { "users": { "passed": true, "quality_score": 1.0, "rows": 208 } }
+        ▼
+  3. Confirm       Data is already in MinIO from step 1. This step checks which
+                   sources passed validation and marks them ready for Spark.
+                   Sources that failed validation are excluded from transform.
+        │
+        ▼  s3a://raw-bucket/{source}/date=YYYY-MM-DD/part-00000.parquet
+        ▼
+  4. Transform     Submit a Spark job (spark/transform_daily.py) to the cluster.
+                   Spark reads all validated sources and applies the medallion pattern:
+                     Bronze → Silver (cleanse, cast, flatten nested structs, deduplicate)
+                     Silver → Gold  (aggregate by company, date)
+                   Outputs written to MinIO at s3://processed-bucket/silver/ and /gold/
+        │
+        ▼  s3a://processed-bucket/gold/date=YYYY-MM-DD/part-*.parquet
+        ▼
+  5. Load          Read gold Parquet from MinIO (via boto3), convert to records,
+                   and write to the warehouse using an idempotent MERGE.
+                   Safe to retry — running it twice gives the same result.
+        │
+        ▼
   6. Monitor       Post-load checks: data freshness, row counts, cost tracking.
-                   Sends a Slack alert if SLA is missed (> 4 hours total).
 ```
 
-**Why this order is best practice:**
+**Why this architecture scales:**
 
-- Validate before storing — bad data is rejected before it ever touches persistent storage
-- Small data (XCom) → Parquet on object storage → Spark reads it: each layer uses the right tool for the job size
-- Parquet on MinIO is the universal handoff format — Spark, pandas, and DuckDB can all read it
-- The medallion pattern (Bronze/Silver/Gold) keeps raw data untouched so bugs can be reprocessed
+| Bottleneck | Old approach | New approach |
+|-----------|-------------|-------------|
+| XCom size | Push all data rows into PostgreSQL | Push only MinIO paths (bytes) |
+| Validation speed | Python `for` loop over every row | `df.isnull().any(axis=1).sum()` — one pandas op |
+| Memory in ingest | Load full dataset into RAM | Stream 100 rows at a time → write → free |
+| Save to MinIO | Re-read from XCom then write | Data already in MinIO from ingest |
+| Pagination style | `_page=1&_limit=N` (JSONPlaceholder) | `limit=N&skip=offset` (standard offset-based) |
 
-**What the 20 sources are:**
+**What data looks like at each stage:**
 
-| Category | Sources |
-|---|---|
-| Users & social | JSONPlaceholder users, posts, comments, todos, albums |
-| Random profiles | RandomUser API |
-| Geography | REST Countries |
-| Weather | Open-Meteo (New York, London, Tokyo) |
-| Crypto | CoinGecko prices + trending |
-| Public datasets | Universities, cat facts, dog breeds |
-| Space | NASA APOD, ISS live position |
-| HTTP testing | httpbin.org JSON + user-agent |
-| File source | S3 transactions from MinIO |
+| Stage | Location | Format | Size (1M records) |
+|---|---|---|---|
+| During ingest | MinIO (`raw-bucket`) | Parquet chunks (100 rows each) | ~50 MB |
+| After validate | XCom (Airflow Postgres) | Small metadata dict | < 1 KB |
+| After confirm | `s3://raw-bucket/{source}/date={ds}/` | Parquet | ~50 MB |
+| After Spark silver | `s3://processed-bucket/silver/date={ds}/` | Parquet | ~30 MB |
+| After Spark gold | `s3://processed-bucket/gold/date={ds}/` | Parquet (aggregated) | < 1 MB |
+| After load | `s3://warehouse/dim_users/latest.parquet` | Parquet (MinIO) | < 1 MB |
 
 ---
 
 ### DAG 2 — `kafka_streaming_monitor` (runs every 15 minutes)
 
-This DAG does **not** run the Spark streaming job — that runs as a separate long-lived process (`spark/streaming_job.py`). This DAG only watches over it.
+This DAG monitors the long-lived Spark Streaming job (`spark/streaming_job.py`) and restarts it automatically if it crashes.
 
 ```
 Every 15 minutes:
 
-  1. Check lag     Connect to Kafka and measure how far behind the consumer group is.
-       │
-       ▼
-  2. Evaluate      If lag > 50,000 messages → fire a warning alert and fail the DAG
-                   so the on-call person is notified.
-                   If lag is normal → pass silently.
+  1. Check job     Query Spark Master REST API: is StreamingIngest running?
+        │
+        ▼
+  2. Restart       If the job is down → submit it via spark-submit in background.
+        │          If it's already running → skip.
+        ▼
+  3. Check lag     Connect to Kafka (kafka:29092) and calculate real consumer lag:
+                     lag = latest_offset - consumer_group_committed_offset
+        │
+        ▼
+  4. Evaluate      lag < 50,000 → OK, log and pass
+                   lag > 50,000 → fire alert, fail the DAG to notify on-call
 ```
 
-If you do not have the streaming job running, this DAG will log a warning and skip (it does not crash the whole setup).
+The Spark Streaming job (`spark/streaming_job.py`) runs continuously: reads from `raw-events` Kafka topic → writes Parquet to `s3a://raw-bucket/streaming/events/` every 60 seconds.
+
+**First-time start (run once manually):**
+```bash
+docker exec -d pipeline-spark-master spark-submit \
+  --master spark://spark-master:7077 \
+  --name StreamingIngest \
+  --packages "org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.2,org.apache.hadoop:hadoop-aws:3.4.1" \
+  /opt/spark-jobs/streaming_job.py
+```
+
+After the first start, the DAG handles restarts automatically.
 
 ---
 
@@ -117,53 +138,33 @@ An independent watchdog that checks whether the batch pipeline is staying health
 ```
 Every hour:
 
-  1. Freshness     Look at the warehouse output file (fact_events.parquet).
-                   If it is older than 4 hours → SLA miss alert is fired.
-       │
-       ▼
-  2. Row counts    Check that fact_events has at least 1,000 rows.
-                   Warns if the table looks suspiciously empty.
+  1. Freshness     Check warehouse output. If older than 4 hours → SLA miss alert.
+        │
+        ▼
+  2. Row counts    Check that warehouse table has at least 1,000 rows.
 ```
-
-This DAG is independent from the batch pipeline — it keeps running even if the batch pipeline fails, so you always know the last time data was fresh.
 
 ---
 
 ### How the three DAGs relate
 
 ```
-                         ┌─────────────────────────┐
-                         │  daily_batch_pipeline    │  runs once a day
-                         │  Ingest→Validate→        │  writes fact_events.parquet
-                         │  Transform→Load→Monitor  │
-                         └────────────┬────────────┘
-                                      │ output
-                    ┌─────────────────┴──────────────────┐
-                    ▼                                     ▼
-     ┌──────────────────────────┐        ┌───────────────────────────┐
-     │  pipeline_health_monitor │        │  kafka_streaming_monitor  │
-     │  (every hour)            │        │  (every 15 min)           │
-     │  Checks freshness and    │        │  Watches the Kafka        │
-     │  row counts of output    │        │  consumer lag             │
-     └──────────────────────────┘        └───────────────────────────┘
+                      ┌──────────────────────────────┐
+                      │     daily_batch_pipeline      │  midnight daily
+                      │  Ingest → Validate →          │
+                      │  Confirm → Transform →        │
+                      │  Load → Monitor               │
+                      └──────────────┬───────────────┘
+                                     │ writes to MinIO / warehouse
+               ┌─────────────────────┴──────────────────────┐
+               ▼                                             ▼
+┌──────────────────────────┐              ┌──────────────────────────────┐
+│  pipeline_health_monitor │              │  kafka_streaming_monitor     │
+│  every hour              │              │  every 15 min                │
+│  Checks freshness and    │              │  Watches Spark Streaming job │
+│  row counts of output    │              │  and Kafka consumer lag      │
+└──────────────────────────┘              └──────────────────────────────┘
 ```
-
-The batch pipeline **produces** data. The monitoring DAGs **observe** it. They are loosely coupled — each can fail independently without taking down the others.
-
----
-
-### Where data lives at each stage
-
-| Stage | Location | Format |
-|---|---|---|
-| After ingest | XCom (Airflow Postgres) | Python list of dicts |
-| After validate | XCom | Python dict (quality scores) |
-| After save_to_minio | `s3://raw-bucket/{source}/date={ds}/data.parquet` | Parquet (MinIO) |
-| After Spark silver | `s3://processed-bucket/silver/date={ds}/` | Parquet (MinIO) |
-| After Spark gold | `s3://processed-bucket/gold/date={ds}/` | Parquet (MinIO) |
-| After load (demo) | `/tmp/warehouse/fact_events.parquet` | Parquet (local) |
-| After load (production) | Snowflake / BigQuery table | SQL table |
-| Pipeline metadata | PostgreSQL | Airflow internal DB |
 
 ---
 
@@ -175,26 +176,23 @@ Kafka handles the **streaming side** of the Lambda architecture — events that 
 
 ```
 Event Producers (apps, IoT, clickstreams)
-        │
         │  publish messages
         ▼
-   Kafka Topic (raw_events, raw_transactions)
-        │
+   Kafka Topic "raw-events"
         │  consume messages
         ▼
   Spark Streaming Job (spark/streaming_job.py)
-        │  runs 24/7 as a long-lived process
-        │  micro-batches every 30 seconds
+        │  runs 24/7, micro-batches every 60 seconds
         ▼
-   MinIO (s3://raw-bucket/streaming/...)
+   MinIO (s3a://raw-bucket/streaming/events/event_date=YYYY-MM-DD/)
         │
         ▼
-  Airflow monitors lag every 15 minutes (kafka_streaming_monitor DAG)
+  Airflow monitors lag every 15 min (kafka_streaming_monitor DAG)
 ```
 
 ### How Kafka is configured
 
-This project runs Kafka in **KRaft mode** — no ZooKeeper required (available from Confluent 8.x). KRaft means Kafka manages its own metadata internally using a Raft consensus log.
+This project runs Kafka in **KRaft mode** — no ZooKeeper required (Confluent 8.x+). KRaft means Kafka manages its own metadata internally using a Raft consensus log.
 
 ```yaml
 KAFKA_PROCESS_ROLES: broker,controller       # single node acts as both
@@ -205,23 +203,21 @@ KAFKA_LISTENERS:
   CONTROLLER://kafka:9093                    # Raft consensus
 ```
 
-**Two listeners** because Kafka needs to tell clients where to reconnect after the initial connection:
-- Inside Docker, other containers use `kafka:29092`
-- From your Mac, you use `localhost:9092`
-
-### Topics used
-
-| Topic | Producer | Consumer | Purpose |
-|---|---|---|---|
-| `raw_events` | Application events | Spark Streaming | User activity, clicks |
-| `raw_transactions` | Payment system | Spark Streaming | Financial transactions |
+**Two listeners** because Kafka tells clients where to reconnect after the initial handshake:
+- Inside Docker → containers use `kafka:29092`
+- From your Mac → use `localhost:9092`
 
 ### Consumer lag monitoring
 
-The `kafka_streaming_monitor` DAG connects to Kafka every 15 minutes and measures **consumer lag** — how many messages are in the topic that the Spark consumer has not yet read.
+The `kafka_streaming_monitor` DAG calculates real lag every 15 minutes:
 
-- Lag = 0: Spark is keeping up in real time
-- Lag growing: Spark is falling behind, data is accumulating
+```
+lag = end_offset (latest message on partition)
+    - committed_offset (last message Spark confirmed reading)
+```
+
+- Lag = 0: Spark is keeping up
+- Lag growing: Spark is falling behind
 - Lag > 50,000: alert fires, DAG fails to notify on-call
 
 ### Connect to Kafka locally
@@ -232,40 +228,41 @@ docker exec pipeline-kafka kafka-topics --bootstrap-server kafka:29092 --list
 
 # Produce a test message
 docker exec -it pipeline-kafka kafka-console-producer \
-  --bootstrap-server kafka:29092 --topic raw_events
+  --bootstrap-server kafka:29092 --topic raw-events
 
 # Consume messages
 docker exec -it pipeline-kafka kafka-console-consumer \
-  --bootstrap-server kafka:29092 --topic raw_events --from-beginning
+  --bootstrap-server kafka:29092 --topic raw-events --from-beginning
 ```
 
 ---
 
 ## Spark in detail
 
-Spark handles the **heavy transformation** — processing that would be too slow or too memory-intensive for a single Python process.
+Spark handles heavy transformation — the medallion architecture with three layers of increasingly clean data.
 
-### What Spark does here
-
-The Spark job (`spark/transform_daily.py`) implements the **medallion architecture** — three layers of increasingly clean data:
+### Medallion architecture
 
 ```
-s3://raw-bucket/*/date=YYYY-MM-DD/data.parquet
-  (Bronze — raw, exactly as ingested)
+s3a://raw-bucket/*/date=YYYY-MM-DD/part-*.parquet
+  (Bronze — raw Parquet chunks, exactly as ingested from dummyjson.com)
         │
-        │  cleanse: drop nulls in required columns
-        │  cast: amount → double, user_id → int
+        │  combine: firstName + lastName → name
+        │  cleanse: drop nulls in id, firstName, email
+        │  cast: id → int
+        │  flatten address: city, state, country  (drop nested coordinates)
+        │  flatten company: company_name, company_department  (drop nested address)
+        │  drop: hair, bank, crypto  (not needed for analytics)
         │  deduplicate: remove exact duplicate rows
-        │  audit: add _ingested_at, _source columns
+        │  audit: add _source, _loaded_at columns
         ▼
-s3://processed-bucket/silver/date=YYYY-MM-DD/
-  (Silver — clean, typed, deduplicated)
+s3a://processed-bucket/silver/date=YYYY-MM-DD/
+  (Silver — clean, typed, flat schema)
         │
-        │  enrich: join with user_segments dimension table
-        │  aggregate: group by user_segment + date
-        │             sum(amount), count(events), avg(session_length)
+        │  aggregate: group by event_date + company_name + company_department
+        │             count(users), collect_list(names), collect_list(emails)
         ▼
-s3://processed-bucket/gold/date=YYYY-MM-DD/
+s3a://processed-bucket/gold/date=YYYY-MM-DD/
   (Gold — business-ready aggregates)
 ```
 
@@ -274,60 +271,77 @@ s3://processed-bucket/gold/date=YYYY-MM-DD/
 | Layer | What it is | Who uses it |
 |---|---|---|
 | Bronze | Raw data, never modified | Debugging, reprocessing from scratch |
-| Silver | Clean + typed | Data scientists, ad-hoc analysis |
-| Gold | Aggregated business metrics | BI dashboards, analyst reports |
+| Silver | Clean, typed, flat | Data scientists, ad-hoc queries |
+| Gold | Aggregated business metrics | Dashboards, analyst reports |
 
-If a bug is found in the Silver logic, you reprocess from Bronze — the raw data was never touched.
+If a bug is found in Silver logic, reprocess from Bronze — the raw data was never touched.
 
 ### How Spark connects to MinIO
 
-MinIO is S3-compatible, so Spark reads/writes it using the `s3a://` protocol (Hadoop's S3A connector):
+MinIO is S3-compatible. Spark uses the `s3a://` protocol with Hadoop's S3A connector:
 
 ```python
-spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.endpoint", "http://minio:9000")
-spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.access.key", "minioadmin")
-spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.path.style.access", "true")
+hadoop_conf.set("fs.s3a.endpoint", "http://minio:9000")
+hadoop_conf.set("fs.s3a.access.key", "minioadmin")
+hadoop_conf.set("fs.s3a.path.style.access", "true")   # required for MinIO
+hadoop_conf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
 ```
 
-`path.style.access = true` is required for MinIO because it does not support the AWS virtual-hosted URL style (`bucket.s3.amazonaws.com`).
+`path.style.access = true` is required because MinIO does not support AWS virtual-hosted URL style (`bucket.s3.amazonaws.com`).
 
 ### How Airflow submits the Spark job
 
-The `transform` task uses `SparkSubmitOperator`, which runs `spark-submit` to send the job to the Spark master:
+`SparkSubmitOperator` runs `spark-submit` using the Spark binary shared from the spark-master container:
 
 ```python
 SparkSubmitOperator(
     task_id='transform',
-    application='/spark/transform_daily.py',
-    application_args=['--date', '{{ ds }}'],   # Jinja template — Airflow fills in the date
+    conn_id='spark_default',                              # → spark://spark-master:7077
+    application='/opt/airflow/spark/transform_daily.py',
+    application_args=['--date', '{{ ds }}'],              # Airflow fills in the run date
+    packages='org.apache.hadoop:hadoop-aws:3.4.1,'        # S3A JARs for MinIO
+             'com.amazonaws:aws-java-sdk-bundle:1.12.262',
     conf={
-        'spark.executor.memory': '4g',
-        'spark.executor.cores': 4,
-        'spark.driver.memory': '2g',
+        'spark.executor.memory': '2g',
+        'spark.driver.memory': '1g',
     },
-    num_executors=4,   # 4 workers × 4 cores × 4 GB = 64 GB total capacity
 )
 ```
 
-`{{ ds }}` is an Airflow template variable that resolves to the run date (e.g. `2026-05-05`). This is how the Spark job knows which date partition to process.
+`{{ ds }}` is an Airflow template variable that resolves to the run date (e.g. `2026-05-06`).
+
+### How spark-submit is available in Airflow
+
+The Airflow container does not bundle Spark. Instead, the Spark binary is shared via a Docker named volume:
+
+```
+spark-master container
+  /opt/spark/  ← Spark 4.0.2 installation
+      └── mounted into spark_home volume
+
+airflow-scheduler container
+  /opt/spark/ (read-only) ← same volume
+      └── spark-submit ✓
+```
+
+Java 17 is installed in the Airflow image (`openjdk-17-jre-headless`) and `SPARK_HOME=/opt/spark` is set so `spark-submit` is found automatically.
 
 ### Spark cluster layout
 
 ```
 Airflow Scheduler
-    │  spark-submit (via SparkSubmitOperator)
+    │  spark-submit (SparkSubmitOperator, client mode)
     ▼
 Spark Master (spark://spark-master:7077)
-    │  assigns work
-    ├──▶ Spark Worker 1 (2 cores, 2 GB)
-    └──▶ Spark Worker 2 (2 cores, 2 GB)  ← add more workers to scale
+    │  assigns tasks
+    └──▶ Spark Worker (2 cores, 2 GB RAM)
 ```
 
-In this local setup there is one worker with 2 cores and 2 GB. In production you would run multiple workers (or use a managed cluster like EMR or Databricks).
+In production, add more workers to scale horizontally — or use a managed cluster (EMR, Databricks, Dataproc).
 
 ### View Spark jobs
 
-Open the Spark Master UI at http://localhost:8088 — you can see running and completed jobs, executor memory usage, and job duration.
+Open the Spark Master UI at http://localhost:8088 — running and completed jobs, executor memory usage, and job duration.
 
 ---
 
@@ -336,25 +350,16 @@ Open the Spark Master UI at http://localhost:8088 — you can see running and co
 ### 1. Set up Python
 
 ```bash
-# Install Python 3.12 (required — stack is not compatible with 3.13/3.14)
 mise install python@3.12
 mise local python 3.12
-
-# Verify
 python --version   # Python 3.12.x
 ```
 
 ### 2. Install Python dependencies
 
 ```bash
-# Core + dev tools
 poetry install --with dev
-
-# Optional: Airflow operators/providers (for IDE type checking)
-poetry install --with airflow
-
-# Point your IDE to the venv
-poetry env info --path   # copy this path → set as Python interpreter
+poetry env info --path   # copy → set as IDE interpreter
 ```
 
 ### 3. Start all services
@@ -363,13 +368,13 @@ poetry env info --path   # copy this path → set as Python interpreter
 docker compose up -d
 ```
 
-Wait ~30 seconds for health checks to pass, then verify:
+Wait ~60 seconds for health checks to pass:
 
 ```bash
 docker ps --format "table {{.Names}}\t{{.Status}}"
 ```
 
-Expected output — all services `healthy` (spark-worker and monitoring show `Up`):
+Expected output:
 
 ```
 pipeline-airflow-webserver   Up ... (healthy)
@@ -385,15 +390,9 @@ pipeline-grafana             Up ...
 
 ### 4. Get the Airflow admin password
 
-Airflow 3 auto-generates a password on first start:
-
 ```bash
 docker logs pipeline-airflow-webserver 2>&1 | grep "Password for user"
-```
-
-Output example:
-```
-Simple auth manager | Password for user 'admin': seNsfpB5eH3aTnTk
+# Simple auth manager | Password for user 'admin': seNsfpB5eH3aTnTk
 ```
 
 ---
@@ -402,11 +401,11 @@ Simple auth manager | Password for user 'admin': seNsfpB5eH3aTnTk
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
-| **Airflow** | http://localhost:8080 | `admin` / see step 4 above |
+| **Airflow** | http://localhost:8080 | `admin` / see step 4 |
 | **Spark Master UI** | http://localhost:8088 | — |
 | **Spark Worker UI** | http://localhost:8081 | — |
 | **MinIO Console** | http://localhost:9001 | `minioadmin` / `minioadmin` |
-| **MinIO API (S3)** | http://localhost:9000 | `minioadmin` / `minioadmin` |
+| **MinIO API** | http://localhost:9000 | `minioadmin` / `minioadmin` |
 | **Prometheus** | http://localhost:9090 | — |
 | **Grafana** | http://localhost:3000 | `admin` / `admin` |
 | **Kafka** | `localhost:9092` | — |
@@ -416,36 +415,25 @@ Simple auth manager | Password for user 'admin': seNsfpB5eH3aTnTk
 
 ## Trigger the pipeline
 
-Once Airflow is up, trigger the daily batch DAG:
-
 ```bash
-# Via CLI inside the scheduler container
+# Via CLI
 docker exec pipeline-airflow-scheduler airflow dags trigger daily_batch_pipeline
 
-# Or open the Airflow UI → DAGs → daily_batch_pipeline → Trigger
+# Or: Airflow UI → DAGs → daily_batch_pipeline → Trigger ▶
 ```
 
-The DAG runs: **Ingest → Validate → Save to MinIO → Spark Transform → Load → Monitor**
+Flow: **Ingest → Validate → Confirm → Transform → Load → Monitor**
 
 ---
 
 ## Development
 
 ```bash
-# Run tests
-poetry run pytest
-
-# Run tests with coverage
-poetry run pytest --cov=src --cov-report=term-missing
-
-# Lint
-poetry run ruff check src/ tests/
-
-# Format check
-poetry run black --check src/ tests/
-
-# Type check
-poetry run mypy src/
+poetry run pytest                                   # run tests
+poetry run pytest --cov=src --cov-report=term-missing  # with coverage
+poetry run ruff check src/ tests/                   # lint
+poetry run black --check src/ tests/               # format check
+poetry run mypy src/                               # type check
 ```
 
 ---
@@ -453,14 +441,9 @@ poetry run mypy src/
 ## Stopping and resetting
 
 ```bash
-# Stop all containers (keep data)
-docker compose down
-
-# Stop and wipe all volumes (full reset)
-docker compose down -v
+docker compose down          # stop (keep volumes)
+docker compose down -v       # stop + wipe all data
 ```
-
-After a full reset, start from step 3 — Airflow will generate a new admin password.
 
 ---
 
@@ -468,34 +451,32 @@ After a full reset, start from step 3 — Airflow will generate a new admin pass
 
 ```
 production-data-pipeline/
-├── docker-compose.yml          # All services
+├── docker-compose.yml          # All services + volumes
+├── Dockerfile.airflow          # Airflow image (Java 17 + providers)
 ├── pyproject.toml              # Python dependencies (Poetry)
-├── pyrightconfig.json          # IDE type checking config
 │
 ├── airflow/
 │   └── dags/
-│       └── daily_batch_pipeline.py   # Main ETL DAG
+│       ├── daily_batch_pipeline.py     # Main ETL DAG
+│       ├── kafka_streaming_dag.py      # Streaming monitor DAG
+│       └── monitoring_dag.py           # Health monitor DAG
+│
+├── spark/
+│   ├── transform_daily.py      # Batch transform (Bronze→Silver→Gold)
+│   └── streaming_job.py        # Kafka→MinIO streaming (runs 24/7)
 │
 ├── src/
 │   ├── ingestion/
-│   │   └── base_connector.py   # API, File, Database connectors
+│   │   └── base_connector.py   # APIConnector with fetch_pages() pagination
 │   ├── validation/
-│   │   └── quality_gates.py    # Null checks, business rules
-│   ├── transformation/         # Spark jobs
+│   │   └── quality_gates.py    # Null checks, business rules (pandas vectorized)
+│   ├── transformation/         # SparkTransformer, aggregations, enrichment
 │   ├── warehouse/
-│   │   └── warehouse_loader.py # Idempotent load
+│   │   └── warehouse_loader.py # Idempotent load → MinIO warehouse bucket
 │   └── monitoring/             # Prometheus metrics, alerting
 │
-├── config/
-│   └── prometheus.yml          # Prometheus scrape config
-│
-├── scripts/
-│   └── create_airflow_user.py  # Fallback user creation script
-│
-└── tests/
-    ├── test_ingestion.py
-    ├── test_validation.py
-    └── integration/
+└── config/
+    └── prometheus.yml          # Prometheus scrape config
 ```
 
 ---
@@ -503,25 +484,33 @@ production-data-pipeline/
 ## Architecture
 
 ```
-20 Data Sources (REST APIs, S3 files, Kafka)
-        │
-        ▼
-  Ingestion Layer          async fetch, retries, schema validation
-        │  XCom (Postgres)
-        ▼
-  Validation Layer         null checks, business rules, quality gates (≥95%)
-        │  XCom (Postgres)
-        ▼
-  Save to MinIO            Parquet → s3://raw-bucket/{source}/date={ds}/
-        │  s3a:// (MinIO)
-        ▼
-  Spark Transform          Bronze → Silver (cleanse) → Gold (aggregate)
-        │  s3a:// (MinIO)
-        ▼
-  Warehouse Load           idempotent merge, s3://processed-bucket/gold/
-        │
-        ▼
-  Monitoring               freshness check, cost tracking, Prometheus metrics
+REST APIs (dummyjson.com/users — 208 users)
+  │  page-by-page (100 rows/page, limit/skip offset pagination)
+  │  3 pages: skip=0 (100), skip=100 (100), skip=200 (8)
+  │  write directly to MinIO as Parquet chunks
+  ▼
+MinIO raw-bucket/{source}/date={ds}/part-*.parquet
+  │  read with pandas (vectorized null check)
+  ▼
+Validate (pandas)
+  │  XCom: small metadata only (paths + quality scores)
+  ▼
+Spark Transform
+  │  Bronze → Silver (cleanse, flatten) → Gold (aggregate)
+  │  spark-submit from Airflow via shared volume
+  ▼
+MinIO processed-bucket/gold/date={ds}/
+  │  read with boto3 → warehouse load
+  ▼
+MinIO warehouse/dim_users/latest.parquet
+
+─── Streaming path (parallel) ────────────────────────────
+Kafka "raw-events"
+  │  Spark Structured Streaming (60s micro-batch)
+  ▼
+MinIO raw-bucket/streaming/events/event_date={ds}/
+  │  lag monitored every 15 min (kafka_streaming_monitor DAG)
+  │  auto-restart on crash
 ```
 
 ---
@@ -531,20 +520,32 @@ production-data-pipeline/
 **Airflow webserver not healthy**
 ```bash
 docker logs pipeline-airflow-webserver --tail 50
-# Health endpoint: http://localhost:8080/api/v2/monitor/health
 ```
 
-**Postgres container exits immediately**
+**DAG not reloading after code change**
 ```bash
-# If upgrading from a previous version, wipe the volume:
-docker compose down -v
-docker compose up -d
+# Changes to src/ files require a forced reparse:
+touch airflow/dags/daily_batch_pipeline.py
+# Or:
+docker exec pipeline-airflow-scheduler airflow dags reserialize
+```
+
+**Spark transform fails with S3A error**
+```bash
+# Verify MinIO is healthy and the raw-bucket exists:
+docker exec pipeline-airflow-scheduler \
+  python -c "import boto3; s3=boto3.client('s3',endpoint_url='http://minio:9000',aws_access_key_id='minioadmin',aws_secret_access_key='minioadmin'); print(s3.list_buckets())"
 ```
 
 **Kafka unhealthy**
 ```bash
-# Test broker connectivity from inside the container:
 docker exec pipeline-kafka kafka-broker-api-versions --bootstrap-server kafka:29092
+```
+
+**spark-submit not found in Airflow**
+```bash
+# The spark_home volume must be populated by spark-master first:
+docker compose restart airflow-scheduler
 ```
 
 **Poetry using wrong Python version**

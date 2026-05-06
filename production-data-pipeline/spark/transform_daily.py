@@ -29,7 +29,8 @@ def main(date: str):
     hadoop_conf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
 
     # --- BRONZE: read all raw sources for this date ---
-    raw_path = f"s3a://raw-bucket/*/date={date}/data.parquet"
+    # ingest_data writes: users/date=<date>/part-00000.parquet, part-00001.parquet ...
+    raw_path = f"s3a://raw-bucket/*/date={date}/"
     try:
         raw = spark.read.parquet(raw_path)
         logger.info(f"Loaded {raw.count()} raw rows from {raw_path}")
@@ -41,29 +42,45 @@ def main(date: str):
     actual_cols = set(raw.columns)
 
     # --- SILVER: cleanse using columns that actually exist ---
-    # Required cols are those present in the data; skip missing ones gracefully
-    required_cols = [c for c in ["id", "name", "email"] if c in actual_cols]
+    required_cols = [c for c in ["id", "firstName", "lastName", "email"] if c in actual_cols]
     silver = transformer.cleanse(raw, required_cols=required_cols)
     silver = transformer.cast_columns(silver, {"id": "int"})
     silver = transformer.add_audit_columns(silver, source="users_api")
 
-    # Add partition date (users data has no timestamp column)
+    # Add partition date
     silver = silver.withColumn("event_date", F.lit(date).cast("date"))
 
-    # Flatten nested structs if present (address, company from /users API)
+    # Combine firstName + lastName → name
+    if "firstName" in actual_cols and "lastName" in actual_cols:
+        silver = (
+            silver
+            .withColumn("name", F.concat_ws(" ", F.col("firstName"), F.col("lastName")))
+            .drop("firstName", "lastName")
+        )
+
+    # Flatten address: city, state, country (drop nested coordinates)
     if "address" in actual_cols:
         silver = (
             silver
             .withColumn("city", F.col("address.city"))
-            .withColumn("zipcode", F.col("address.zipcode"))
+            .withColumn("state", F.col("address.state"))
+            .withColumn("country", F.col("address.country"))
             .drop("address")
         )
+
+    # Flatten company: name, department (company also has nested address — drop it)
     if "company" in actual_cols:
         silver = (
             silver
             .withColumn("company_name", F.col("company.name"))
+            .withColumn("company_department", F.col("company.department"))
             .drop("company")
         )
+
+    # Drop deep-nested columns that are hard to flatten and not needed for gold
+    drop_cols = [c for c in ["hair", "bank", "crypto", "coordinates"] if c in set(silver.columns)]
+    if drop_cols:
+        silver = silver.drop(*drop_cols)
 
     silver_path = f"s3a://processed-bucket/silver/date={date}/"
     silver.write.mode("overwrite").parquet(silver_path)
@@ -72,10 +89,11 @@ def main(date: str):
     # --- GOLD: aggregate users by company ---
     gold = (
         silver
-        .groupBy("event_date", "company_name")
+        .groupBy("event_date", "company_name", "company_department")
         .agg(
             F.count("*").alias("user_count"),
             F.collect_list("name").alias("user_names"),
+            F.collect_list("email").alias("user_emails"),
         )
     )
 
