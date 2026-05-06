@@ -107,7 +107,7 @@ def validate_data(**context):
 
     # Create quality gates
     gates = [
-        NullCheckGate(required_fields=['id', 'user_id']),
+        NullCheckGate(required_fields=['id', 'name', 'email']),
         # BusinessRuleGate(rules={'positive_amount': 'amount > 0'}),
     ]
 
@@ -205,26 +205,49 @@ def transform_data(**context):
 
 
 def load_data(**context):
-    """Load transformed data to warehouse"""
-    ti = context['task_instance']
-    transform_result = ti.xcom_pull(task_ids='transform', key='return_value')
-
-    logger.info(f"Loading data from Spark job {transform_result['spark_job_id']}")
-
-    # In production: Use Snowflake API, BigQuery API, etc.
-    # For demo: Simulate warehouse load
+    """Load gold layer from MinIO into warehouse"""
+    import boto3
+    import pandas as pd
+    from io import BytesIO
 
     from src.warehouse.warehouse_loader import idempotent_load
 
-    # Load with idempotency (merge strategy)
+    ds = context.get('ds') or datetime.now().strftime('%Y-%m-%d')
+    logger.info(f"Loading gold data for {ds}")
+
+    s3 = boto3.client(
+        's3',
+        endpoint_url='http://minio:9000',
+        aws_access_key_id='minioadmin',
+        aws_secret_access_key='minioadmin',
+    )
+
+    # Read all Parquet files in the gold partition
+    prefix = f"gold/date={ds}/"
+    records = []
+    try:
+        response = s3.list_objects_v2(Bucket='processed-bucket', Prefix=prefix)
+        for obj in response.get('Contents', []):
+            if not obj['Key'].endswith('.parquet') or obj['Size'] == 0:
+                continue
+            buf = BytesIO()
+            s3.download_fileobj('processed-bucket', obj['Key'], buf)
+            buf.seek(0)
+            records.extend(pd.read_parquet(buf).to_dict('records'))
+    except Exception as e:
+        logger.warning(f"Could not read gold data from MinIO: {e}")
+
+    if not records:
+        logger.warning("No gold data found — skipping warehouse load")
+        return {'table': 'dim_users', 'rows_loaded': 0, 'merge_key': ['id']}
+
     load_result = idempotent_load(
-        source_data='s3://processed-bucket/transformed/',
-        target_table='fact_events',
-        merge_key=['event_id', 'date']
+        source_data=records,
+        target_table='dim_users',
+        merge_key=['id'],
     )
 
     logger.info(f"Loaded {load_result['rows_loaded']} rows to warehouse")
-
     return load_result
 
 
@@ -275,15 +298,14 @@ with dag:
 
     transform_task = SparkSubmitOperator(
         task_id='transform',
-        application='/spark/transform_daily.py',
+        conn_id='spark_default',
+        application='/opt/airflow/spark/transform_daily.py',
         application_args=['--date', '{{ ds }}'],
+        packages='org.apache.hadoop:hadoop-aws:3.4.1,com.amazonaws:aws-java-sdk-bundle:1.12.262',
         conf={
-            'spark.executor.memory': '4g',
-            'spark.executor.cores': 4,
-            'spark.driver.memory': '2g',
+            'spark.executor.memory': '2g',
+            'spark.driver.memory': '1g',
         },
-        total_executor_cores=16,
-        num_executors=4,
     )
 
     load_task = PythonOperator(

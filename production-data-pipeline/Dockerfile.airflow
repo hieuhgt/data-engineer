@@ -1,5 +1,19 @@
 FROM apache/airflow:3.2.1-python3.12
 
+# Java is required to run spark-submit
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openjdk-17-jre-headless \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/lib/jvm/java-17-openjdk-* /usr/lib/jvm/java-17
+
+# Symlink works on both amd64 and arm64
+ENV JAVA_HOME=/usr/lib/jvm/java-17
+ENV SPARK_HOME=/opt/spark
+ENV PATH="/opt/spark/bin:${PATH}"
+
+USER airflow
+
 RUN pip install --no-cache-dir \
     apache-airflow-providers-standard==1.12.0 \
     apache-airflow-providers-apache-spark==6.0.0 \

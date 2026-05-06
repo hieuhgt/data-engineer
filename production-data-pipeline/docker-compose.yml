@@ -36,15 +36,21 @@ services:
       AIRFLOW__API__BASE_URL: "http://airflow-webserver:8080"
       AIRFLOW__API_AUTH__JWT_SECRET: "2FMy0AOAeXhLx-HFvAcKrc10g9gNFgXljUOEk8xiun17QWBup2e-di2wwr8Fnh6cCYYT5cmwi9SuPz_edTM91g=="
       PYTHONPATH: "/opt/airflow"
+      # Spark connection — points to spark-master (no YARN)
+      AIRFLOW_CONN_SPARK_DEFAULT: "spark://spark-master:7077"
     depends_on:
       postgres:
         condition: service_healthy
+      spark-master:
+        condition: service_started
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins
       - ./config:/opt/airflow/config
       - ./src:/opt/airflow/src
+      - ./spark:/opt/airflow/spark
       - airflow_logs:/opt/airflow/logs
+      - spark_home:/opt/spark:ro   # spark-submit binary from spark-master image
     networks:
       - pipeline
     healthcheck:
@@ -140,6 +146,10 @@ services:
     ports:
       - "8088:8080"
       - "7077:7077"
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - ./src:/opt/src
+      - spark_home:/opt/spark   # export Spark binary for Airflow to use
     networks:
       - pipeline
     healthcheck:
@@ -160,6 +170,9 @@ services:
       SPARK_WORKER_WEBUI_PORT: "8081"
     ports:
       - "8081:8081"
+    volumes:
+      - ./spark:/opt/spark-jobs
+      - ./src:/opt/src
     networks:
       - pipeline
 
@@ -198,6 +211,7 @@ volumes:
   prometheus_data:
   grafana_data:
   airflow_logs:
+  spark_home:   # shared Spark binary between spark-master and airflow-scheduler
 
 networks:
   pipeline:

@@ -116,14 +116,17 @@ class NullCheckGate(QualityGate):
         fail_count = 0
 
         for i, record in enumerate(data):
+            record_failed = False
             for field in self.required_fields:
                 if record.get(field) is None:
-                    fail_count += 1
+                    record_failed = True
                     if len(errors) < 5:
                         errors.append(f"Row {i}: Null in required field '{field}'")
+            if record_failed:
+                fail_count += 1
 
         pass_count = len(data) - fail_count
-        pass_rate = pass_count / len(data) if data else 0
+        pass_rate = pass_count / len(data)
 
         result = ValidationResult(
             passed=pass_rate >= self.threshold,

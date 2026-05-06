@@ -1,6 +1,7 @@
 """
-Structured Streaming job: Kafka → Bronze (Parquet).
+Structured Streaming job: Kafka → Bronze (Parquet on MinIO).
 Run continuously alongside the daily batch pipeline.
+Managed by kafka_streaming_monitor DAG (auto-restart if crashed).
 """
 import logging
 import sys
@@ -15,6 +16,11 @@ from pyspark.sql.types import StringType, StructField, StructType, DoubleType, I
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+KAFKA_BOOTSTRAP = "kafka:29092"   # internal Docker listener (not 9092)
+MINIO_ENDPOINT = "http://minio:9000"
+BRONZE_PATH = "s3a://raw-bucket/streaming/events/"
+CHECKPOINT_PATH = "s3a://raw-bucket/_checkpoints/events/"
+
 EVENT_SCHEMA = StructType([
     StructField("event_id", StringType()),
     StructField("user_id", IntegerType()),
@@ -28,13 +34,22 @@ def main():
     spark = get_spark("StreamingIngest")
     spark.sparkContext.setLogLevel("WARN")
 
+    # MinIO S3A config (same as transform_daily.py)
+    hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+    hadoop_conf.set("fs.s3a.endpoint", MINIO_ENDPOINT)
+    hadoop_conf.set("fs.s3a.access.key", "minioadmin")
+    hadoop_conf.set("fs.s3a.secret.key", "minioadmin")
+    hadoop_conf.set("fs.s3a.path.style.access", "true")
+    hadoop_conf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+
     # Read from Kafka
     raw = (
         spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", "kafka:9092")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", "raw-events")
         .option("startingOffsets", "latest")
+        .option("kafka.group.id", "spark-streaming-group")
         .load()
     )
 
@@ -45,21 +60,22 @@ def main():
         .select("e.*")
         .withColumn("ingested_at", F.current_timestamp())
         .withColumn("event_date", F.to_date(F.col("timestamp")))
+        .filter(F.col("event_id").isNotNull())  # drop malformed events
     )
 
-    # Write to Bronze (partitioned by date, checkpointed for exactly-once)
+    # Write to Bronze on MinIO (partitioned by date, checkpointed for exactly-once)
     query = (
         parsed.writeStream
         .format("parquet")
         .partitionBy("event_date")
-        .option("path", "s3://data-lake/bronze/events/")
-        .option("checkpointLocation", "s3://data-lake/_checkpoints/events/")
+        .option("path", BRONZE_PATH)
+        .option("checkpointLocation", CHECKPOINT_PATH)
         .outputMode("append")
-        .trigger(processingTime="60 seconds")  # Micro-batch every 60s
+        .trigger(processingTime="60 seconds")
         .start()
     )
 
-    logger.info("Streaming job started – waiting for termination")
+    logger.info(f"Streaming job started — writing to {BRONZE_PATH}")
     query.awaitTermination()
 
 

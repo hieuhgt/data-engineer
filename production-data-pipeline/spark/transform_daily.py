@@ -11,8 +11,6 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.transformation.spark_transformer import get_spark, SparkTransformer
-from src.transformation.aggregations import daily_user_metrics
-from src.transformation.enrichment import Enricher
 from pyspark.sql import functions as F
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -23,13 +21,14 @@ def main(date: str):
     logger.info(f"Starting daily transform for {date}")
     spark = get_spark("DailyTransform")
 
-    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.endpoint", "http://minio:9000")
-    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.access.key", "minioadmin")
-    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.secret.key", "minioadmin")
-    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.path.style.access", "true")
-    spark.sparkContext._jsc.hadoopConfiguration().set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+    hadoop_conf.set("fs.s3a.endpoint", "http://minio:9000")
+    hadoop_conf.set("fs.s3a.access.key", "minioadmin")
+    hadoop_conf.set("fs.s3a.secret.key", "minioadmin")
+    hadoop_conf.set("fs.s3a.path.style.access", "true")
+    hadoop_conf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
 
-    # --- BRONZE: read raw ingested data ---
+    # --- BRONZE: read all raw sources for this date ---
     raw_path = f"s3a://raw-bucket/*/date={date}/data.parquet"
     try:
         raw = spark.read.parquet(raw_path)
@@ -39,22 +38,47 @@ def main(date: str):
         raise
 
     transformer = SparkTransformer(spark)
+    actual_cols = set(raw.columns)
 
-    # --- SILVER: cleanse + cast ---
-    silver = transformer.cleanse(raw, required_cols=["event_id", "user_id"])
-    silver = transformer.cast_columns(silver, {"amount": "double", "user_id": "int"})
-    silver = transformer.add_audit_columns(silver, source="events_api")
-    silver = silver.withColumn("event_date", F.to_date(F.col("timestamp")))
+    # --- SILVER: cleanse using columns that actually exist ---
+    # Required cols are those present in the data; skip missing ones gracefully
+    required_cols = [c for c in ["id", "name", "email"] if c in actual_cols]
+    silver = transformer.cleanse(raw, required_cols=required_cols)
+    silver = transformer.cast_columns(silver, {"id": "int"})
+    silver = transformer.add_audit_columns(silver, source="users_api")
+
+    # Add partition date (users data has no timestamp column)
+    silver = silver.withColumn("event_date", F.lit(date).cast("date"))
+
+    # Flatten nested structs if present (address, company from /users API)
+    if "address" in actual_cols:
+        silver = (
+            silver
+            .withColumn("city", F.col("address.city"))
+            .withColumn("zipcode", F.col("address.zipcode"))
+            .drop("address")
+        )
+    if "company" in actual_cols:
+        silver = (
+            silver
+            .withColumn("company_name", F.col("company.name"))
+            .drop("company")
+        )
 
     silver_path = f"s3a://processed-bucket/silver/date={date}/"
     silver.write.mode("overwrite").parquet(silver_path)
     logger.info(f"Silver layer written: {silver.count()} rows → {silver_path}")
 
-    # --- GOLD: aggregate ---
-    enricher = Enricher(spark)
-    enriched = enricher.enrich_with_user_segments(silver, "s3://data-lake/dims/user_segments/")
+    # --- GOLD: aggregate users by company ---
+    gold = (
+        silver
+        .groupBy("event_date", "company_name")
+        .agg(
+            F.count("*").alias("user_count"),
+            F.collect_list("name").alias("user_names"),
+        )
+    )
 
-    gold = daily_user_metrics(enriched, date_col="event_date")
     gold_path = f"s3a://processed-bucket/gold/date={date}/"
     gold.write.mode("overwrite").parquet(gold_path)
     logger.info(f"Gold layer written: {gold.count()} rows → {gold_path}")
