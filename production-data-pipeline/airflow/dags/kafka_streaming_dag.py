@@ -43,14 +43,19 @@ dag = DAG(
 def check_streaming_job_alive(**context):
     """
     Query Spark Master REST API to verify the streaming job is in RUNNING state.
-    If the job is not running, push a flag so the next task can restart it.
+    Spark REST API response: [{"name": "...", "attempts": [{"completed": false}]}]
+    A job is alive if it has an attempt with completed=false.
     """
     try:
         resp = requests.get(f"{SPARK_MASTER_API}/applications", timeout=5)
         resp.raise_for_status()
         apps = resp.json()
 
-        running = [a for a in apps if a.get("name") == STREAMING_APP_NAME and a.get("state") == "RUNNING"]
+        running = [
+            a for a in apps
+            if a.get("name") == STREAMING_APP_NAME
+            and not a.get("attempts", [{}])[0].get("completed", True)
+        ]
         is_alive = len(running) > 0
 
         logger.info(f"Streaming job alive={is_alive}, running_instances={len(running)}")
@@ -82,15 +87,29 @@ def restart_streaming_if_down(**context):
         "spark-submit",
         "--master", "spark://spark-master:7077",
         "--name", STREAMING_APP_NAME,
-        "--packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0",
+        # Spark 4.0.2 uses Scala 2.13 + hadoop-aws for MinIO S3A
+        "--packages", (
+            "org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.2,"
+            "org.apache.hadoop:hadoop-aws:3.4.1,"
+            "com.amazonaws:aws-java-sdk-bundle:1.12.262"
+        ),
+        "--conf", "spark.executor.memory=512m",
+        "--conf", "spark.driver.memory=512m",
+        "--conf", "spark.cores.max=1",
         "--conf", "spark.hadoop.fs.s3a.endpoint=http://minio:9000",
         "--conf", "spark.hadoop.fs.s3a.access.key=minioadmin",
         "--conf", "spark.hadoop.fs.s3a.secret.key=minioadmin",
         "--conf", "spark.hadoop.fs.s3a.path.style.access=true",
         "/opt/airflow/spark/streaming_job.py",
     ]
-    # detach=True so this task completes without waiting for the streaming job
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # start_new_session=True detaches from Airflow's process group so the
+    # streaming job keeps running after this task finishes
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     logger.info(f"Streaming job resubmitted (pid={proc.pid})")
     return {"action": "restarted", "pid": proc.pid}
 

@@ -298,17 +298,56 @@ SparkSubmitOperator(
     task_id='transform',
     conn_id='spark_default',                              # → spark://spark-master:7077
     application='/opt/airflow/spark/transform_daily.py',
-    application_args=['--date', '{{ ds }}'],              # Airflow fills in the run date
     packages='org.apache.hadoop:hadoop-aws:3.4.1,'        # S3A JARs for MinIO
              'com.amazonaws:aws-java-sdk-bundle:1.12.262',
     conf={
-        'spark.executor.memory': '2g',
-        'spark.driver.memory': '1g',
+        'spark.executor.memory': '512m',
+        'spark.driver.memory': '512m',
+        'spark.sql.shuffle.partitions': '4',
+        'spark.eventLog.enabled': 'true',
+        'spark.eventLog.dir': '/tmp/spark-events',
     },
 )
 ```
 
-`{{ ds }}` is an Airflow template variable that resolves to the run date (e.g. `2026-05-06`).
+### Resource allocation — why 512m and 1 core?
+
+The local Docker environment has **1 worker with 2 cores and 2 GB RAM**. Two Spark jobs run on this single worker at the same time:
+
+```
+Worker (2 cores, 2 GB RAM)
+├── StreamingIngest (Kafka → MinIO, runs 24/7)
+│     executor: 512m, 1 core
+│     actual RAM used: 512m + 384m overhead = ~896m
+│
+└── DailyTransform (batch ETL, runs when triggered)
+      executor: 512m, 1 core
+      actual RAM used: 512m + 384m overhead = ~896m
+
+Total: ~1.8 GB RAM, 2 cores → fits inside 2 GB worker ✓
+```
+
+**Why not use more memory?**
+Spark always adds a memory overhead on top of `spark.executor.memory`:
+```
+actual memory = executor.memory + max(executor.memory × 10%, 384MB)
+```
+So `512m` executor → `512 + 384 = 896MB` actual.
+Two jobs × 896MB = 1.79 GB — just fits in 2 GB.
+
+If you set `executor.memory=2g`, one job alone would need `2048 + 384 = 2.4 GB` — more than the entire worker has. Spark would refuse to start the executor and the job would hang with:
+```
+WARN TaskSchedulerImpl: Initial job has not accepted any resources
+```
+
+**Why `spark.cores.max=1` for StreamingIngest?**
+Without this, Spark greedily takes all available cores (2). That leaves 0 cores for DailyTransform, which also causes the same "no resources" hang. Setting `cores.max=1` for the streaming job reserves 1 core for the batch job to use.
+
+**In production** (EMR, Databricks, Dataproc), you'd have many workers with many cores and GB of RAM each — these settings would be much larger and tuned per job. The 512m/1-core config is specific to this local single-worker setup.
+
+### Spark History Server
+
+After a job finishes, its Jobs/Stages/Tasks detail is visible at **http://localhost:18080** (Spark History Server). The History Server reads event logs written to a shared Docker volume (`spark_events`) that both the Airflow scheduler and the History Server mount.
 
 ### How spark-submit is available in Airflow
 
@@ -335,6 +374,8 @@ Airflow Scheduler
 Spark Master (spark://spark-master:7077)
     │  assigns tasks
     └──▶ Spark Worker (2 cores, 2 GB RAM)
+              ├── StreamingIngest: 1 core, 512m  (24/7)
+              └── DailyTransform:  1 core, 512m  (on demand)
 ```
 
 In production, add more workers to scale horizontally — or use a managed cluster (EMR, Databricks, Dataproc).

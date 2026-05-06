@@ -51,6 +51,7 @@ services:
       - ./spark:/opt/airflow/spark
       - airflow_logs:/opt/airflow/logs
       - spark_home:/opt/spark:ro   # spark-submit binary from spark-master image
+      - spark_events:/tmp/spark-events
     networks:
       - pipeline
     healthcheck:
@@ -173,8 +174,27 @@ services:
     volumes:
       - ./spark:/opt/spark-jobs
       - ./src:/opt/src
+      - spark_events:/tmp/spark-events
     networks:
       - pipeline
+
+  # Spark History Server — view Jobs/Stages/Tasks after job finishes
+  spark-history-server:
+    image: apache/spark:4.0.2-python3
+    container_name: pipeline-spark-history
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+    environment:
+      SPARK_HISTORY_OPTS: >-
+        -Dspark.history.fs.logDirectory=/tmp/spark-events
+        -Dspark.history.ui.port=18080
+    ports:
+      - "18080:18080"
+    volumes:
+      - spark_events:/tmp/spark-events
+    networks:
+      - pipeline
+    depends_on:
+      - spark-master
 
   # Prometheus (metrics collection)
   prometheus:
@@ -211,7 +231,8 @@ volumes:
   prometheus_data:
   grafana_data:
   airflow_logs:
-  spark_home:   # shared Spark binary between spark-master and airflow-scheduler
+  spark_home:     # shared Spark binary between spark-master and airflow-scheduler
+  spark_events:   # shared event logs between airflow-scheduler and spark-history-server
 
 networks:
   pipeline:

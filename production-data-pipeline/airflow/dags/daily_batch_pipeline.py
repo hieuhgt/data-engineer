@@ -77,6 +77,7 @@ dag = DAG(
     schedule='0 0 * * *',
     tags=['production', 'batch', 'daily'],
     catchup=False,
+    max_active_runs=1,  # chỉ 1 run tại 1 thời điểm — tránh conflict ghi cùng partition
 )
 
 # ---------------------------------------------------------------------------
@@ -279,11 +280,14 @@ with dag:
         task_id='transform',
         conn_id='spark_default',
         application='/opt/airflow/spark/transform_daily.py',
-        application_args=['--date', '{{ ds }}'],
+        application_args=[],  # transform_daily.py defaults to today; matches ingest_data behavior
         packages='org.apache.hadoop:hadoop-aws:3.4.1,com.amazonaws:aws-java-sdk-bundle:1.12.262',
         conf={
-            'spark.executor.memory': '2g',
-            'spark.driver.memory': '1g',
+            'spark.executor.memory': '512m',
+            'spark.driver.memory': '512m',
+            'spark.sql.shuffle.partitions': '4',
+            'spark.eventLog.enabled': 'true',
+            'spark.eventLog.dir': '/tmp/spark-events',
         },
     )
 

@@ -107,6 +107,12 @@ def main(date: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", required=True, help="Partition date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="Partition date (YYYY-MM-DD). Defaults to today if not provided.",
+    )
     args = parser.parse_args()
-    main(args.date)
+    from datetime import date as _date
+    run_date = args.date or _date.today().isoformat()
+    main(run_date)
