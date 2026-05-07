@@ -1,0 +1,112 @@
+[
+  {
+    "id": 1,
+    "firstName": "Emily",
+    "lastName": "Johnson",
+    "email": "emily.johnson@example.com",
+    "age": 28,
+    "gender": "female",
+    "phone": "+1-555-0101",
+    "address": {
+      "address": "123 Main St",
+      "city": "New York",
+      "state": "NY",
+      "stateCode": "NY",
+      "postalCode": "10001",
+      "country": "United States"
+    },
+    "company": {
+      "name": "Acme Corp",
+      "department": "Engineering",
+      "title": "Software Engineer"
+    }
+  },
+  {
+    "id": 2,
+    "firstName": "Michael",
+    "lastName": "Williams",
+    "email": "michael.williams@example.com",
+    "age": 35,
+    "gender": "male",
+    "phone": "+1-555-0102",
+    "address": {
+      "address": "456 Oak Ave",
+      "city": "San Francisco",
+      "state": "CA",
+      "stateCode": "CA",
+      "postalCode": "94102",
+      "country": "United States"
+    },
+    "company": {
+      "name": "TechStart Inc",
+      "department": "Product",
+      "title": "Product Manager"
+    }
+  },
+  {
+    "id": 3,
+    "firstName": "Sophia",
+    "lastName": "Martinez",
+    "email": "sophia.martinez@example.com",
+    "age": 31,
+    "gender": "female",
+    "phone": "+1-555-0103",
+    "address": {
+      "address": "789 Pine Rd",
+      "city": "Austin",
+      "state": "TX",
+      "stateCode": "TX",
+      "postalCode": "73301",
+      "country": "United States"
+    },
+    "company": {
+      "name": "Acme Corp",
+      "department": "Data",
+      "title": "Data Engineer"
+    }
+  },
+  {
+    "id": 4,
+    "firstName": "James",
+    "lastName": "Brown",
+    "email": "james.brown@example.com",
+    "age": 42,
+    "gender": "male",
+    "phone": "+1-555-0104",
+    "address": {
+      "address": "321 Elm St",
+      "city": "Chicago",
+      "state": "IL",
+      "stateCode": "IL",
+      "postalCode": "60601",
+      "country": "United States"
+    },
+    "company": {
+      "name": "DataFlow LLC",
+      "department": "Engineering",
+      "title": "Senior Data Engineer"
+    }
+  },
+  {
+    "id": 5,
+    "firstName": "Olivia",
+    "lastName": "Davis",
+    "email": "olivia.davis@example.com",
+    "age": 26,
+    "gender": "female",
+    "phone": "+1-555-0105",
+    "address": {
+      "address": "654 Maple Dr",
+      "city": "Seattle",
+      "state": "WA",
+      "stateCode": "WA",
+      "postalCode": "98101",
+      "country": "United States"
+    },
+    "company": {
+      "name": "TechStart Inc",
+      "department": "Data",
+      "title": "Analytics Engineer"
+    }
+  }
+]
