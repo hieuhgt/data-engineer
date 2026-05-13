@@ -1,0 +1,70 @@
+main:
+  params: [args]
+  steps:
+
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - cloud_run_url: ${default(map.get(args, "cloud_run_url"), "")}
+          - max_pages: ${default(map.get(args, "max_pages"), 10)}
+          - run_id: ${sys.now()}
+
+    - log_start:
+        call: sys.log
+        args:
+          text: ${"[ETL] Pipeline started — run_id=" + string(run_id) + " max_pages=" + string(max_pages)}
+          severity: INFO
+
+    - validate_args:
+        switch:
+          - condition: ${cloud_run_url == ""}
+            raise: "cloud_run_url argument is required"
+
+    - call_scraper:
+        try:
+          call: http.post
+          args:
+            url: ${cloud_run_url + "/start-pipeline"}
+            auth:
+              type: OIDC
+            body:
+              max_pages: ${max_pages}
+            timeout: 120
+          result: scraper_resp
+        except:
+          as: e
+          steps:
+            - log_scraper_error:
+                call: sys.log
+                args:
+                  text: ${"[ETL] Scraper call failed: " + json.encode_to_string(e)}
+                  severity: ERROR
+            - raise_scraper_error:
+                raise: ${e}
+
+    - check_scraper_response:
+        switch:
+          - condition: ${scraper_resp.code == 202}
+            next: log_success
+          - condition: true
+            next: raise_bad_response
+
+    - raise_bad_response:
+        raise:
+          code: ${scraper_resp.code}
+          message: ${"Unexpected scraper status: " + string(scraper_resp.code)}
+
+    - log_success:
+        call: sys.log
+        args:
+          text: >-
+            ${"[ETL] Tasks queued — pages=" + string(scraper_resp.body.pages_queued)
+               + " tasks=" + string(scraper_resp.body.task_count)}
+          severity: INFO
+
+    - return_result:
+        return:
+          run_id: ${string(run_id)}
+          status: "success"
+          pages_queued: ${scraper_resp.body.pages_queued}
+          task_count: ${scraper_resp.body.task_count}

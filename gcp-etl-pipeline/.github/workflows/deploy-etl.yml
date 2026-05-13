@@ -1,0 +1,240 @@
+name: Deploy ETL Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scraper/**"
+      - "functions/**"
+      - "workflows/**"
+      - ".github/workflows/deploy-etl.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which service to deploy"
+        required: false
+        default: "all"
+        type: choice
+        options: [all, scraper, function, workflow]
+
+# Only one deployment runs at a time per branch
+concurrency:
+  group: deploy-etl-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  AR_REPO: etl-pipeline
+  SCRAPER_IMAGE: etl-scraper
+  CLOUD_RUN_SERVICE: etl-scraper
+  FUNCTION_NAME: etl-process-page
+  WORKFLOW_NAME: etl-pipeline
+
+jobs:
+  # ── 1. Tests ──────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short
+
+  # ── 2. Docker build + push to Artifact Registry ───────────────────────────
+  build-push:
+    name: Build & Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image: ${{ steps.image.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (keyless)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.PIPELINE_SA_EMAIL }}
+          token_format: access_token
+
+      - name: Login to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Resolve image tag
+        id: image
+        run: |
+          TAG="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SCRAPER_IMAGE }}:${{ github.sha }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: scraper
+          push: true
+          tags: |
+            ${{ steps.image.outputs.tag }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SCRAPER_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 3. Deploy Cloud Run (scraper) ─────────────────────────────────────────
+  deploy-scraper:
+    name: Deploy Cloud Run
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write   # no checkout — image already in Artifact Registry
+
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.PIPELINE_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ env.CLOUD_RUN_SERVICE }}" \
+            --image="${{ needs.build-push.outputs.image }}" \
+            --platform=managed \
+            --region="${{ env.REGION }}" \
+            --service-account="${{ vars.PIPELINE_SA_EMAIL }}" \
+            --no-allow-unauthenticated \
+            --memory=512Mi \
+            --cpu=1 \
+            --timeout=120 \
+            --min-instances=0 \
+            --max-instances=3 \
+            --set-env-vars="\
+          GCP_PROJECT_ID=${{ env.PROJECT_ID }},\
+          GCP_REGION=${{ env.REGION }},\
+          TASK_QUEUE_NAME=${{ vars.TASK_QUEUE_NAME }},\
+          FUNCTION_URL=${{ vars.FUNCTION_URL }},\
+          PIPELINE_SA_EMAIL=${{ vars.PIPELINE_SA_EMAIL }},\
+          SCRAPE_BASE_URL=${{ vars.SCRAPE_BASE_URL }},\
+          MAX_PAGES=${{ vars.MAX_PAGES }}" \
+            --project="${{ env.PROJECT_ID }}"
+
+      - name: Print Cloud Run URL
+        run: |
+          URL=$(gcloud run services describe "${{ env.CLOUD_RUN_SERVICE }}" \
+            --platform=managed --region="${{ env.REGION }}" \
+            --project="${{ env.PROJECT_ID }}" \
+            --format="value(status.url)")
+          echo "::notice title=Cloud Run::Deployed → ${URL}"
+
+  # ── 4. Deploy Cloud Function (processor) ──────────────────────────────────
+  deploy-function:
+    name: Deploy Cloud Function
+    needs: test
+    if: |
+      github.event_name == 'push' ||
+      contains(fromJson('["all","function"]'), inputs.target)
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.PIPELINE_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Cloud Function (Gen 2)
+        run: |
+          gcloud functions deploy "${{ env.FUNCTION_NAME }}" \
+            --gen2 \
+            --runtime=python311 \
+            --region="${{ env.REGION }}" \
+            --source=functions/processor \
+            --entry-point=process_page \
+            --trigger-http \
+            --service-account="${{ vars.PIPELINE_SA_EMAIL }}" \
+            --set-env-vars="GCS_BUCKET_NAME=${{ vars.GCS_BUCKET_NAME }},SCRAPE_BASE_URL=${{ vars.SCRAPE_BASE_URL }}" \
+            --memory=512Mi \
+            --timeout=120s \
+            --min-instances=0 \
+            --max-instances=20 \
+            --ingress-settings=internal-and-gclb \
+            --no-allow-unauthenticated \
+            --project="${{ env.PROJECT_ID }}"
+
+      - name: Print Function URL
+        run: |
+          URL=$(gcloud functions describe "${{ env.FUNCTION_NAME }}" \
+            --gen2 --region="${{ env.REGION }}" \
+            --project="${{ env.PROJECT_ID }}" \
+            --format="value(serviceConfig.uri)")
+          echo "::notice title=Cloud Function::Deployed → ${URL}"
+
+  # ── 5. Update Cloud Workflow YAML ─────────────────────────────────────────
+  deploy-workflow:
+    name: Update Cloud Workflow
+    needs: [deploy-scraper, deploy-function]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      (
+        github.event_name == 'push' ||
+        contains(fromJson('["all","workflow"]'), inputs.target)
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.PIPELINE_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Cloud Workflow definition
+        run: |
+          gcloud workflows deploy "${{ env.WORKFLOW_NAME }}" \
+            --location="${{ env.REGION }}" \
+            --source=workflows/etl_pipeline.yaml \
+            --service-account="${{ vars.PIPELINE_SA_EMAIL }}" \
+            --project="${{ env.PROJECT_ID }}"
+
+      - name: Confirm deployment
+        run: |
+          echo "::notice title=Workflow::Cloud Workflow '${WORKFLOW_NAME}' updated"
